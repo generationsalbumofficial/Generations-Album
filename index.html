@@ -198,6 +198,24 @@ textarea.input{resize:vertical;min-height:80px}
 .cmain.ro{cursor:default}
 
 /* ---------- guest landing / public view ---------- */
+
+/* ---------- guest landing ---------- */
+.l2{max-width:420px;margin:0 auto;padding:14px 20px calc(14px + env(safe-area-inset-bottom,0px));min-height:100vh;min-height:100svh;display:flex;flex-direction:column;justify-content:center;text-align:center;color:var(--on-bg)}
+.l2 .hero-logo{display:block;width:clamp(66px,13svh,100px);height:clamp(66px,13svh,100px);margin:0 auto 10px;filter:drop-shadow(0 10px 14px rgba(14,30,24,.36));opacity:0;animation:logopop .6s cubic-bezier(.2,1.4,.4,1) .05s forwards}
+@keyframes logopop{from{opacity:0;transform:scale(.6)}to{opacity:1;transform:none}}
+@media (prefers-reduced-motion:reduce){.l2 .hero-logo{animation:none;opacity:1}}
+.l2 h1{font-size:26px;line-height:1.1;margin:2px 0 4px}
+.l2 p.sub{margin:0 auto;max-width:340px;color:var(--on-bg-soft);font-size:12.5px;line-height:1.4}
+.l2 .tag2{font-size:9.5px;font-weight:700;letter-spacing:.16em;text-transform:uppercase;color:var(--on-bg-soft);margin:9px 0 0}
+.l2 .feats{list-style:none;margin:14px 0 14px;padding:0;display:grid;gap:8px;text-align:left}
+.l2 .feats li{display:flex;gap:10px;align-items:center;padding:8px 12px;background:rgba(255,255,255,.14);border:1.5px solid rgba(255,255,255,.3);border-radius:12px;font-size:12px;line-height:1.3;color:#fff}
+.l2 .feats .fi{flex:none;width:30px;height:30px;border-radius:8px;background:#fff;border:2px solid var(--ink);display:grid;place-items:center;color:var(--forest)}
+.l2 .feats .fi svg{width:16px;height:16px}
+.l2 .cta2{display:grid;gap:9px}
+.l2 .cta2 .btn{width:100%;padding:11px;font-size:14px}
+.l2 .cta2 .btn.ghost{background:#fff}
+.top-in{position:relative}
+.brandc{position:absolute;left:50%;transform:translateX(-50%)}
 .landing{max-width:520px;margin:0 auto;padding:46px 16px 80px;color:var(--on-bg);text-align:center}
 .landing .logo.big{width:64px;height:64px;border-radius:14px;margin:0 auto 18px}
 .landing .logo.big svg{width:34px;height:34px}
@@ -282,6 +300,7 @@ textarea.input{resize:vertical;min-height:80px}
 </style>
 </head>
 <body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><symbol id="ppl" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4.2" fill="#2F5D50"/><path d="M3.5 21c0-4.6 3.8-7.6 8.5-7.6s8.5 3 8.5 7.6z" fill="#2F5D50"/></symbol></svg>
 <div id="app"></div>
 <div id="modalRoot"></div>
 <div id="toast" class="toast"></div>
@@ -321,8 +340,10 @@ function modal(html) {
 }
 const closeModal = () => { $('#modalRoot').innerHTML = ''; };
 const setView = html => { $('#app').innerHTML = html; };
+
 const MENU_BTN = `<button class="iconbtn" id="menuBtn" aria-label="Menu">&#9776;</button>`;
 const HOME_BTN = `<a class="iconbtn" href="#/" id="homeBtn" aria-label="Home"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.5 12 4l9 7.5"/><path d="M5.5 10v9.5h4.5V14h4v5.5h4.5V10"/></svg></a>`;
+const brandC = `<div class="grow"></div>${brand}<div class="grow"></div>`;
 const topbar = inner => `<header class="top"><div class="top-in">${inner}</div></header>`;
 
 /* ---------------------------- backends ---------------------------- */
@@ -702,7 +723,7 @@ async function route() {
     }
   }
   if (!S.tree) {
-    setView(`${topbar(brand)}<div class="loading"><span class="spin dark" style="width:28px;height:28px"></span></div>`);
+    setView(`${topbar(brandC)}<div class="loading"><span class="spin dark" style="width:28px;height:28px"></span></div>`);
     try {
       /* login: only the light list of generations (GIDs) is loaded. Rows still without a GID come in full. */
       const r = await api('loadIndex');
@@ -712,7 +733,7 @@ async function route() {
         else S.index.push({...e, created: i});
       });
     }
-    catch (e) { S.tree = null; if (/Session expired|log in/i.test(e.message)) { clearAuth(); return viewAuth('login'); } return setView(`${topbar(brand)}<div class="empty">${esc(e.message)}<br><br><button class="btn" onclick="route()">Try again</button></div>`); }
+    catch (e) { S.tree = null; if (/Session expired|log in/i.test(e.message)) { clearAuth(); return viewAuth('login'); } return setView(`${topbar(brandC)}<div class="empty">${esc(e.message)}<br><br><button class="btn" onclick="route()">Try again</button></div>`); }
   }
   window.scrollTo(0, 0);
   if (parts[0] === 'g' && parts[1]) {
@@ -1231,12 +1252,18 @@ function addParentsGeneration(uid) {
 /* ---------------------------- GUEST HOME + PUBLIC VIEW (no login) ---------------------------- */
 const PV = {};   // public rows already fetched: gid -> row
 function viewLanding() {
-  setView(`${topbar(brand)}
-  <main class="landing">
-    <div class="logo big">${ICON_TREE}</div>
+  const fi = path => `<span class="fi"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round">${path}</svg></span>`;
+  setView(`<main class="l2">
+    <svg class="hero-logo" viewBox="0 0 512 512" role="img" aria-label="Generation Album"><rect width="512" height="512" rx="120" fill="#2F5D50"/><rect x="76" y="76" width="360" height="360" rx="72" fill="#fff" stroke="#17211d" stroke-width="22"/><g fill="#fff" stroke="#17211d" stroke-width="22" stroke-linecap="round" stroke-linejoin="round"><circle cx="256" cy="186" r="26"/><path d="M256 212V250M196 300V250H316V300" fill="none"/><circle cx="196" cy="326" r="26"/><circle cx="316" cy="326" r="26"/></g></svg>
     <h1>Generation Album</h1>
     <p class="sub">Keep every generation of your family together in one place.</p>
-    <div class="cta"><div class="row"><a class="btn ghost" href="#/login">Log in</a><a class="btn" href="#/signup">Create account</a></div></div>
+    <div class="tag2">Every Generation is One Family</div>
+    <ul class="feats">
+      <li>${fi('<circle cx="10" cy="8" r="3.6"/><path d="M3 20c0-3.8 3.1-6.4 7-6.4M18 8v6M15 11h6"/>')}Add fathers, mothers, sons and daughters with their photos</li>
+      <li>${fi('<path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3A4 4 0 0 0 11 18.7l1-1"/>')}Link every generation to the next and open it with one tap</li>
+      <li>${fi('<rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>')}Share with family, or keep it private</li>
+    </ul>
+    <div class="cta2"><a class="btn" href="#/signup">Create account</a><a class="btn ghost" href="#/login">Log in</a></div>
   </main>`);
 }
 /* fetch ONE public row by GID, then show it. Private and unknown IDs give the same message. */
@@ -1271,7 +1298,7 @@ function pubCard(p, role, nth) {
 async function viewPublic(gid) {
   const top = S.token
     ? topbar(`${HOME_BTN}<div class="grow"></div>${brand}<div class="grow"></div>${S.user ? MENU_BTN : '<span style="width:34px"></span>'}`)
-    : topbar(`${brand}<div class="grow"></div><a class="btn sm ghost" href="#/login">Log in</a>`);
+    : topbar(`<span class="brandc">${brand}</span><div class="grow"></div><a class="btn sm ghost" href="#/login">Log in</a>`);
   if (!isGid(gid)) return setView(`${top}<div class="pubmsg"><h3>Invalid Generation ID</h3><p>A Generation ID has 8 digits.</p></div>`);
   window.scrollTo(0, 0);
   if (!PV[gid]) {
