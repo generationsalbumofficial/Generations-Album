@@ -1,7 +1,7 @@
 /* Generation Album - service worker. Keeps the app shell so it opens like an app.
    NEVER caches the Google Script API or photos: family data is always fresh. Bump VERSION after each website update. */
 const VERSION = 'ga-v8';
-const SHELL = ['./', 'manifest.webmanifest', 'icon-192.png', 'icon-512.png', 'apple-touch-icon.png'];
+const SHELL = ['./', 'manifest.webmanifest', 'icons/icon-192.png', 'icons/icon-512.png', 'icons/apple-touch-icon.png'];
 
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(VERSION).then(c => c.addAll(SHELL)).then(() => self.skipWaiting()));
