@@ -7,8 +7,8 @@
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="favicon.ico" sizes="any">
 <link rel="icon" type="image/svg+xml" href="favicon.svg">
-<link rel="icon" type="image/png" sizes="32x32" href="favicon-32.png">
-<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="icon" type="image/png" sizes="32x32" href="icons/favicon-32.png">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="Generations">
@@ -306,6 +306,11 @@ html[dir=rtl] .langbtn{right:auto;left:12px}
 .step button:disabled{opacity:.35}
 .step output{min-width:64px;text-align:center;font-weight:700;font-size:12.5px}
 .note{font-size:11px;color:var(--muted);margin:8px 0 0;line-height:1.4}
+.dconn{margin:0 0 14px;padding:10px 12px;border:2px dashed var(--line);border-radius:10px;background:var(--sand)}
+.dconn .dcrow{display:flex;gap:8px;margin:10px 0 8px}
+.dconn .dcrow .input{letter-spacing:.06em;font-weight:700;min-width:0}
+.dconn .okmsg{margin:10px 0 0}
+.dconn .okmsg .linkbtn{margin-left:6px}
 .details{display:grid;gap:0;border:2px solid var(--line);border-radius:10px;margin:0 0 16px;overflow:hidden}
 .details>div{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:7px 12px;font-size:11.5px}
 .details>div+div{border-top:1.5px solid var(--sand)}
@@ -333,7 +338,7 @@ html[dir=rtl] .langbtn{right:auto;left:12px}
    CONFIG - paste your Google Apps Script Web App URL here (see Code.gs).
    Leave empty to try the app in DEMO MODE (data stays in this browser).
    ===================================================================== */
-const CONFIG = { API_URL: 'https://script.google.com/macros/s/AKfycbzbZkdoiQe9Ti49HtNK6-1uUxhKnfO0UqPLe9vFVWrnm43NmAXbyhgfwgI00n642ut1/exec' };
+const CONFIG = { API_URL: 'https://script.google.com/macros/s/AKfycbzhgPv2bFuhT3vx_ghqW4Lhxeh0HFWFRP95u6gGbAdzwmqU_gwkWJKeraRqaPSpJCug/exec' };
 
 /* ---------------------------- helpers ---------------------------- */
 const $ = s => document.querySelector(s);
@@ -510,7 +515,24 @@ const Local = {
       u.name = name; return {user: {id: u.id, name, email: u.email}};
     },
     /* demo mode: everything is "full" (no lazy loading needed for local data) */
-    async loadIndex(d, p) { const u = Local.user(d, p); return {rows: (d.rows[u.email] || []).map(r => ({full: true, row: r}))}; },
+    async loadIndex(d, p) {
+      const u = Local.user(d, p), used = new Set();
+      Object.keys(d.rows).forEach(e => d.rows[e].forEach(r => String(r.uids || '').split(',').forEach(x => { if (/^\d{4}$/.test(x.trim())) used.add(x.trim()); })));
+      return {rows: (d.rows[u.email] || []).map(r => ({full: true, row: r})), usedUids: [...used].join(',')};
+    },
+    /* Direct Connect lookup: one person by Generation ID + UID (own or Public generations) */
+    async findPerson(d, p) {
+      const me = Local.user(d, p), gid = String(p.gid || '').trim(), uid = String(p.uid || '').trim();
+      const all = []; Object.keys(d.rows).forEach(e => d.rows[e].forEach(r => all.push({r, mine: e === me.email})));
+      const hit = all.find(x => x.r.gid === gid && (x.mine || x.r.vis === 'Public'));
+      const sp = x => String(x || '').split(',').map(v => v.trim());
+      const j = hit ? sp(hit.r.uids).indexOf(uid) : -1;
+      if (j < 0) throw new Error('No person found with this Generation ID and UID. A private generation can be used only by its owner or people it is shared with.');
+      const r = hit.r, c = sp(r.conv)[j], par = c === 'Fa' || c === 'Mo';
+      const used = all.some(x => x.r.gid !== gid && sp(x.r.uids).some((u2, k) => { const c2 = sp(x.r.conv)[k]; return u2 === uid && (c2 === 'Fa' || c2 === 'Mo') !== par; }));
+      const hidden = sp(r.hide)[j] === 'Yes';
+      return {person: {gid, uid, conv: c, name: String(r.names).split(',')[j].trim(), photo: hidden ? '' : String(r.images).split(',')[j].trim(), married: sp(r.marriage)[j] === 'Yes', link: sp(r.links)[j], used}};
+    },
     async getGen(d, p) {
       const u = Local.user(d, p); const r = (d.rows[u.email] || []).find(x => x.gid === p.gid);
       if (!r) throw new Error('Generation not found.'); return {row: r};
@@ -597,18 +619,25 @@ function upKey(p) { if (p.parentGen && T().gens[p.parentGen]) return p.parentGen
 /* does that generation exist (in memory, or listed in the GID index)? */
 const hasOwn = p => !!ownKey(p) || isGid(p.downGid);   // also true when that family now belongs to another account
 const hasUp = p => !!upKey(p) || isGid(p.upGid);
-function newUid() { return 'p' + rid(); }   // only an in-memory handle for a person - never saved, never shown
+const fmtUid = u => 'UID-' + u;
+/* Person ID: 4 digits (shown as UID-7548), saved in the sheet. S.uidSet = every UID that is already used in the sheet, so a new one never clashes. */
+function newUid() {
+  const taken = u => S.uidSet.has(u) || !!(S.tree && S.tree.people[u]);
+  for (let i = 0; i < 500; i++) { const u = String(1000 + Math.floor(Math.random() * 9000)); if (!taken(u)) return u; }
+  for (let n = 1000; n <= 9999; n++) { const u = String(n); if (!taken(u)) return u; }
+  throw new Error('All 9000 UIDs are used.');
+}
 function newGenId() {
   const ids = new Set(Object.values(T().gens).map(g => g.id)); S.index.forEach(e => ids.add(e.gid)); let id;
   do { id = digits(8); } while (ids.has(id));
   return id;
 }
 function makePerson(gender, extra) {
-  return Object.assign({uid: newUid(), name: '', photo: '', hide: false, gender, married: false, ownGen: null, parentGen: null, upGid: '', downGid: ''}, extra || {});
+  return Object.assign({uid: newUid(), fresh: true, name: '', photo: '', hide: false, gender, married: false, ownGen: null, parentGen: null, upGid: '', downGid: ''}, extra || {});
 }
 function addPerson(p) { T().people[p.uid] = p; S.uidSet.add(p.uid); return p; }
 function createGen(fatherUid, motherUid) {
-  const key = 'g' + fatherUid;   // a person is Father of at most one generation
+  const key = 'g' + rid();   // in-memory key of a new generation (its real ID is created once Father and Mother are filled)
   T().gens[key] = {key, id: '', father: fatherUid, mother: motherUid, sons: [], daughters: [], vis: 'Public', created: Date.now()};   // new generations start Public; the owner can switch to Private later
   [fatherUid, motherUid].forEach(u => { const p = person(u); if (p) { p.ownGen = key; p.married = true; } });
   return key;
@@ -692,7 +721,8 @@ function rowsFromTree() {
         return p.married ? linkFor(p, true) : 'No';
       }).join(','),
       vis: g.vis === 'Public' ? 'Public' : 'Private',
-      hide: ps.map(p => p.hide ? 'Yes' : 'No').join(',')          // Yes = the photo of this person is hidden
+      hide: ps.map(p => p.hide ? 'Yes' : 'No').join(','),         // Yes = the photo of this person is hidden
+      uids: ps.map(p => p.uid).join(',')                          // person IDs, same order
     };
     Object.defineProperty(row, '_h', {value: mem.map(m => m[0])});   // who is who (not saved, not sent)
     return row;
@@ -700,7 +730,7 @@ function rowsFromTree() {
 }
 /* same field order as rowsFromTree, so a freshly loaded row compares equal to what the website would save */
 const normHide = (v, conv) => { const n = String(conv || '').split(',').length, a = String(v || '').split(',').map(x => x.trim()); return Array.from({length: n}, (_, i) => a[i] === 'Yes' ? 'Yes' : 'No').join(','); };
-const normRow = r => ({gid: String(r.gid || '').trim(), names: String(r.names || ''), images: String(r.images || ''), conv: String(r.conv || '').trim(), marriage: String(r.marriage || '').trim(), links: String(r.links || '').trim(), vis: String(r.vis || '').trim() === 'Public' ? 'Public' : 'Private', hide: normHide(r.hide, r.conv)});
+const normRow = r => ({gid: String(r.gid || '').trim(), names: String(r.names || ''), images: String(r.images || ''), conv: String(r.conv || '').trim(), marriage: String(r.marriage || '').trim(), links: String(r.links || '').trim(), vis: String(r.vis || '').trim() === 'Public' ? 'Public' : 'Private', hide: normHide(r.hide, r.conv), uids: String(r.uids || '').split(',').map(x => x.trim()).join(',')});
 const firstUid = r => r.gid;      // the Gen ID is the row key
 
 /* Put ONE spreadsheet row into the tree. Returns the generation key.
@@ -708,8 +738,9 @@ const firstUid = r => r.gid;      // the Gen ID is the row key
    A person already in memory keeps his current (possibly unsaved) data. */
 function ingestRow(row, created) {
   const r = normRow(row), G = r.gid;
+  if (T().gens['g' + G]) return 'g' + G;
   const conv = r.conv.split(',').map(x => x.trim());
-  const names = r.names.split(','), imgs = r.images.split(','), mar = r.marriage.split(','), lnk = r.links.split(','), hides = r.hide.split(',');
+  const names = r.names.split(','), imgs = r.images.split(','), mar = r.marriage.split(','), lnk = r.links.split(','), hides = r.hide.split(','), uidl = r.uids.split(',');
   let father = '', mother = ''; const sons = [], daughters = [];
   conv.forEach((c, j) => {
     if (!GRP.includes(c)) return;
@@ -717,15 +748,17 @@ function ingestRow(row, created) {
     /* The same person can sit in two generations (Son in the parents' one, Father in his own). The Gen ID links tell us who:
        - Father/Mother here: the child of the parents' generation whose own-family link is THIS Gen ID
        - Son/Daughter here: the Father (son) / Mother (daughter) of the linked own-family generation */
-    let p = null;
-    const other = isGid(lk) ? loadedByGid(lk) : null;
+    const ju = (uidl[j] || '').trim(), hasUid = /^\d{4}$/.test(ju);
+    let p = hasUid ? (T().people[ju] || null) : null;           // the same UID = the same person, already opened in another generation
+    const other = !hasUid && isGid(lk) ? loadedByGid(lk) : null;   // old rows without UIDs: find the person through the links
     if (other) {
       if (c === 'Fa' || c === 'Mo') p = [...other.sons, ...other.daughters].map(person).find(x => x && x.downGid === G) || null;
       else p = person(c === 'So' ? other.father : other.mother) || null;
     }
     if (!p) {
-      const uid = newUid();
-      p = T().people[uid] = {uid, name: (names[j] || '').trim(), photo: dec(imgs[j]), hide: (hides[j] || '').trim() === 'Yes', gender: (c === 'Fa' || c === 'So') ? 'm' : 'f',
+      const uid = hasUid ? ju : newUid();
+      S.uidSet.add(uid);
+      p = T().people[uid] = {uid, fresh: !hasUid, name: (names[j] || '').trim(), photo: dec(imgs[j]), hide: (hides[j] || '').trim() === 'Yes', gender: (c === 'Fa' || c === 'So') ? 'm' : 'f',
         married: (mar[j] || '').trim().toLowerCase() === 'yes', ownGen: null, parentGen: null, upGid: '', downGid: ''};
     }
     if (c === 'Fa' || c === 'Mo') p.upGid = lk; else p.downGid = lk;
@@ -780,6 +813,7 @@ async function flushNow() {
       if (upsert.length || remove.length) res = await api('saveRows', {upsert: upsert.map(r => ({...r, base: S.snap[firstUid(r)] === undefined ? 'NEW' : (S.base[firstUid(r)] || '')})), remove});
       upsert.forEach(r => {
         const k = firstUid(r);
+        (r._h || []).forEach(u => { const q = S.tree && S.tree.people[u]; if (q) q.fresh = false; });   // saved: this UID is now taken for good
         S.snap[k] = next[k];
         if (res.upd !== undefined) S.base[k] = String(res.upd);
       });
@@ -788,11 +822,31 @@ async function flushNow() {
     } catch (e) {
       S.saving = false;
       if (/^CONFLICT/.test(e.message)) { S.dirty = false; setStatus('idle'); showConflict(); return; }
+      const uc = /^UID_CLASH:(\d{4})/.exec(e.message);
+      if (uc) {                                           // somebody took the same UID a moment ago: give the NEW person another UID and save again
+        S.dirty = true;
+        if (fixUidClash(uc[1])) continue;
+        setStatus('error'); toast('This UID is already used by another person. Remove the connected person and try again.'); return;
+      }
       S.dirty = true; setStatus('error');
       if (/Session expired|log in/i.test(e.message)) toast(e.message);
       return;
     }
   }
+}
+/* a UID that was picked on this phone but is taken by now: only a person that was never saved can get a new one */
+function fixUidClash(u) {
+  const p = S.tree && S.tree.people[u];
+  if (!p || !p.fresh) return false;
+  S.uidSet.add(u);
+  const n = newUid();
+  delete S.tree.people[u]; p.uid = n; S.tree.people[n] = p; S.uidSet.add(n);
+  Object.values(S.tree.gens).forEach(g => {
+    if (g.father === u) g.father = n;
+    if (g.mother === u) g.mother = n;
+    g.sons = g.sons.map(x => x === u ? n : x); g.daughters = g.daughters.map(x => x === u ? n : x);
+  });
+  return true;
 }
 window.addEventListener('beforeunload', e => { if (S.dirty) { e.preventDefault(); e.returnValue = ''; } });
 
@@ -822,7 +876,7 @@ async function route() {
     try {
       /* login: only the light list of generations (GIDs) is loaded. Rows still without a GID come in full. */
       const r = await api('loadIndex');
-      S.tree = {gens: {}, people: {}}; S.index = []; S.shared = r.shared || []; S.uidSet = new Set(); S.snap = {}; S.base = {}; S.dirty = false;
+      S.tree = {gens: {}, people: {}}; S.index = []; S.shared = r.shared || []; S.uidSet = new Set(String(r.usedUids || '').split(',').filter(Boolean)); S.snap = {}; S.base = {}; S.dirty = false;
       (r.rows || []).forEach((e, i) => {
         if (e.full) ingestRow(e.row, i);
         else S.index.push({...e, created: i});
@@ -1448,10 +1502,21 @@ function openPerson(key, uid, role) {
   const total = isChild ? sibs.length + (isNew ? 1 : 0) : 0;
   let pos = isChild ? (isNew ? total : sibs.indexOf(p.uid) + 1) : 0;
   const lockMarried = !isNew && isChild && hasOwn(p);
+  const canConnect = isNew || !p.name;                      // Direct Connect: only for an empty card (a new Son / Daughter, or a Father / Mother not filled yet)
+  const wantGender = (role === 'father' || role === 'son') ? 'm' : 'f';
+  let conn = null;                                          // the person that was connected (he / she already exists in another generation)
+  const locked = () => lockMarried || !!conn;
 
   const m = modal(`<h3>${title}</h3>
-    <div class="pm-photo"><div class="photo" id="pPhoto" style="position:relative"></div><small id="pLbl"></small></div>
+    ${canConnect ? `<div class="dconn"><button type="button" class="linkbtn" id="dcOpen">&#128279; Direct Connect – add a person who is already in another generation</button>
+      <div id="dcBox" style="display:none">
+        <div class="dcrow"><input class="input" id="dcGid" inputmode="numeric" autocomplete="off" placeholder="Generation ID"><input class="input" id="dcUid" inputmode="numeric" autocomplete="off" placeholder="UID-0000"></div>
+        <button type="button" class="btn sm" id="dcGo">Connect</button>
+        <p class="note">Type the Generation ID and the UID of the person (see the person's details). ${isChild ? 'A Father or Mother of another generation can be connected here as a Son or Daughter.' : 'A Son or Daughter of another generation can be connected here as ' + ROLE_NAME[role] + '.'} The name and photo are taken from there.</p>
+      </div>
+      <div class="okmsg" id="dcOk"></div></div>` : ''}
     <div class="err" id="pErr"></div>
+    <div class="pm-photo"><div class="photo" id="pPhoto" style="position:relative"></div><small id="pLbl"></small></div>
     ${canHide ? `<label class="chk hidechk"><input type="checkbox" id="pHide"><span>Hide this photo from everyone<small>Nobody will see it – not on the cards, not in public or shared views. Untick to show it again.</small></span></label>` : (p.hide ? `<p class="note" style="margin:0 0 14px">This photo is hidden.</p>` : '')}
     <label class="field"><span>Full name *</span><input class="input" id="pName" maxlength="40" placeholder="Name" value="${esc(p.name)}"></label>
     ${isChild ? `<div class="field"><span class="lbl">Marital status</span><div class="seg"><button type="button" data-m="0">Unmarried</button><button type="button" data-m="1">&#9829; Married</button></div>
@@ -1459,6 +1524,7 @@ function openPerson(key, uid, role) {
     <div class="details">
       <div><span>Role</span><b class="role-${role} rolewrap" id="pRole">${ROLE_NAME[role]}${isChild ? ' #' + (true ? `<select class="possel role-${role}" id="pSel" aria-label="Change position">${Array.from({length: total}, (_, k) => `<option value="${k + 1}"${k + 1 === pos ? ' selected' : ''}>${k + 1}</option>`).join('')}</select>` : pos) : ''}</b></div>
       ${g.id ? `<div><span>Generation ID</span><b>${fmtGid(g.id)}</b></div>` : ''}
+      <div><span>UID</span><b id="pUid">${fmtUid(p.uid)}</b></div>
       ${!isChild ? '<div><span>Status</span><b style="color:var(--clay)">&#9829; Married</b></div>' : ''}
     </div>
     <input type="file" id="pFile" accept="image/*" hidden>
@@ -1474,13 +1540,13 @@ function openPerson(key, uid, role) {
   const drawMar = () => {
     if (!isChild) return;
     m.querySelectorAll('.seg button').forEach(b => b.classList.toggle('on', (b.dataset.m === '1') === married));
-    m.querySelector('#mNote').textContent = lockMarried ? (ownKey(p) ? 'This person has a family generation, so it cannot be changed to Unmarried. Delete that generation first.' : 'This person has a linked family generation, so it cannot be changed to Unmarried.')
+    m.querySelector('#mNote').textContent = conn ? 'This person is connected from another generation, so the family generation stays linked.' : lockMarried ? (ownKey(p) ? 'This person has a family generation, so it cannot be changed to Unmarried. Delete that generation first.' : 'This person has a linked family generation, so it cannot be changed to Unmarried.')
       : married ? 'A + button will appear on this card to add their family generation.' : 'The + button appears after marriage.';
   };
   drawPhoto(); drawMar();
   const hc = m.querySelector('#pHide'); if (hc) { hc.checked = hideVal; hc.onchange = () => { hideVal = hc.checked; drawPhoto(); }; }
   const sel = m.querySelector('#pSel'); if (sel) sel.onchange = () => { pos = +sel.value; };
-  if (isChild) m.querySelectorAll('.seg button').forEach(b => b.onclick = () => { if (lockMarried && b.dataset.m === '0') return; married = b.dataset.m === '1'; drawMar(); });
+  if (isChild) m.querySelectorAll('.seg button').forEach(b => b.onclick = () => { if (locked() && b.dataset.m === '0') return; married = b.dataset.m === '1'; drawMar(); });
   const pick = () => m.querySelector('#pFile').click();
   m.querySelector('#pPhoto').onclick = pick; m.querySelector('#pLbl').onclick = pick;
   m.querySelector('#pFile').onchange = async e => {
@@ -1491,25 +1557,79 @@ function openPerson(key, uid, role) {
     busy = false; drawPhoto();
   };
   m.querySelector('#c').onclick = closeModal;
+
+  /* ---- Direct Connect: Generation ID + UID of a person who already exists in another generation ---- */
+  const dcOk = m.querySelector('#dcOk'), nameIn = m.querySelector('#pName');
+  const showConn = () => {
+    const c = conn;
+    nameIn.value = c ? c.name : p.name; nameIn.readOnly = !!c;
+    photoVal = c ? c.photo : p.photo; hideVal = c ? !!(c.q && c.q.hide) : !!p.hide; if (hc) { hc.checked = hideVal; hc.disabled = !!c; }
+    married = c ? true : !!p.married;
+    m.querySelector('#pUid').textContent = fmtUid(c ? c.uid : p.uid);
+    m.querySelector('#pPhoto').style.pointerEvents = c ? 'none' : ''; m.querySelector('#pLbl').style.display = c ? 'none' : '';
+    drawPhoto(); drawMar();
+    if (c) {
+      dcOk.innerHTML = `${esc(tx('Connected:'))} <b>${esc(c.name)}</b> · ${fmtUid(c.uid)} · ${fmtGid(c.srcGid)} <button type="button" class="linkbtn" id="dcUndo">Undo</button>`;
+      dcOk.classList.add('show'); m.querySelector('#dcBox').style.display = 'none'; m.querySelector('#dcOpen').style.display = 'none';
+      m.querySelector('#dcUndo').onclick = () => { conn = null; dcOk.classList.remove('show'); m.querySelector('#dcOpen').style.display = ''; showConn(); };
+    }
+  };
+  const dco = m.querySelector('#dcOpen');
+  if (dco) {
+    dco.onclick = () => { const b = m.querySelector('#dcBox'); b.style.display = b.style.display === 'none' ? '' : 'none'; if (b.style.display === '') m.querySelector('#dcGid').focus(); };
+    const dcGo = async () => {
+      const er = m.querySelector('#pErr'); er.classList.remove('show');
+      const fail = t => { er.textContent = t; er.classList.add('show'); };
+      const gid = m.querySelector('#dcGid').value.replace(/\D/g, ''), uidv = m.querySelector('#dcUid').value.replace(/\D/g, '');
+      if (!isGid(gid)) return fail('Generation ID has 8 digits.');
+      if (!/^\d{4}$/.test(uidv)) return fail('UID has 4 digits, for example UID-7548.');
+      if ([g.father, g.mother, ...g.sons, ...g.daughters].includes(uidv)) return fail('This person is already in this generation.');
+      const btn = m.querySelector('#dcGo'); btn.disabled = true;
+      try {
+        const f = (await withBusy(async () => { await settle(); return api('findPerson', {gid, uid: uidv}); })).person;   // unsaved changes go to the sheet first, so a brand-new generation can be found too
+        const srcParent = f.conv === 'Fa' || f.conv === 'Mo', gender = (f.conv === 'Fa' || f.conv === 'So') ? 'm' : 'f';
+        if (gender !== wantGender) return fail(gender === 'm' ? 'This person is male, so he can be added only as Father or Son.' : 'This person is female, so she can be added only as Mother or Daughter.');
+        if (srcParent === !isChild) return fail(srcParent ? tx('This person is the {0} of generation {1}. Connect him / her as a Son or Daughter here.', ROLE_NAME[{Fa: 'father', Mo: 'mother'}[f.conv]], fmtGid(f.gid)) : tx('This person is a {0} in generation {1}. Connect him / her as a Father or Mother here.', ROLE_NAME[f.conv === 'So' ? 'son' : 'daughter'], fmtGid(f.gid)));
+        if (f.used || isGid(f.link)) return fail(srcParent ? 'This person is already connected to a parents generation.' : 'This person already has a family generation.');
+        let q = T().people[f.uid] || null;                   // generations of this account / admin mode: open the other generation, so both stay in step
+        if (!q && !loadedByGid(f.gid) && inIndex(f.gid)) { await withBusy(() => loadGen(f.gid)); q = T().people[f.uid] || null; }
+        conn = {uid: f.uid, name: f.name, photo: dec(f.photo), gender, srcGid: f.gid, srcParent, q};
+        showConn();
+      } catch (ex) { fail(ex.message); } finally { btn.disabled = false; }
+    };
+    m.querySelector('#dcGo').onclick = dcGo;
+    m.querySelector('#dcUid').onkeydown = m.querySelector('#dcGid').onkeydown = e => { if (e.key === 'Enter') dcGo(); };
+  }
+
   const save = () => {
-    const name = m.querySelector('#pName').value.trim();
+    const name = nameIn.value.trim();
     if (busy) return toast('Photo is still uploading…');
-    if (!name) { const er = m.querySelector('#pErr'); er.textContent = 'Please enter the name.'; er.classList.add('show'); m.querySelector('#pName').focus(); return; }
-    p.name = name.replace(/\s*,\s*/g, ' '); p.photo = photoVal;
-    if (canHide) p.hide = hideVal;
-    if (isChild) p.married = married;
-    if (isNew) { addPerson(p); p.parentGen = key; }
+    if (!name) { const er = m.querySelector('#pErr'); er.textContent = 'Please enter the name.'; er.classList.add('show'); nameIn.focus(); return; }
+    let t = p;                                                  // the person who ends up in this generation
+    if (conn) {
+      t = conn.q || {uid: conn.uid, fresh: false, name: conn.name, photo: conn.photo, hide: false, gender: conn.gender, married: true, ownGen: null, parentGen: null,
+                     upGid: isChild ? '' : conn.srcGid, downGid: isChild ? conn.srcGid : ''};
+      if (!conn.q) addPerson(t);
+      t.married = true;
+      if (isChild) t.parentGen = key;
+      else { if (g.father === p.uid) g.father = t.uid; else g.mother = t.uid; delete T().people[p.uid]; t.ownGen = key; }
+    } else {
+      p.name = name.replace(/\s*,\s*/g, ' '); p.photo = photoVal;
+      if (canHide) p.hide = hideVal;
+      if (isChild) p.married = married;
+      if (isNew) { addPerson(p); p.parentGen = key; }
+    }
     if (isChild) {                                              // put him / her at the chosen position
       const list = role === 'son' ? g.sons : g.daughters;
-      const at = list.indexOf(p.uid); if (at >= 0) list.splice(at, 1);
-      list.splice(Math.min(pos, list.length + 1) - 1, 0, p.uid);
+      const at = list.indexOf(t.uid); if (at >= 0) list.splice(at, 1);
+      list.splice(Math.min(pos, list.length + 1) - 1, 0, t.uid);
     }
     ensureIds(); touch(); closeModal();
     if (g.id && curRef() !== g.id) history.replaceState(null, '', '#/g/' + g.id);   // address bar now shows the Generation ID
     viewGen(key);
   };
   m.querySelector('#ok').onclick = save;
-  m.querySelector('#pName').onkeydown = e => { if (e.key === 'Enter') save(); };
+  nameIn.onkeydown = e => { if (e.key === 'Enter') save(); };
   const del = m.querySelector('#del');
   if (del) del.onclick = async () => {
     if (g.mine === false && hasOwn(p)) return toast('This person has a family generation. Only the admin (owner) of this generation can delete them.');
@@ -1518,7 +1638,7 @@ function openPerson(key, uid, role) {
     try { await withBusy(() => ensureDown(p)); } catch (ex) { return toast(ex.message); }   // load their family below so it is deleted too
     deleteChild(key, p.uid); touch(); closeModal(); viewGen(key);
   };
-  if (isNew || !p.name) m.querySelector('#pName').focus();
+  if (isNew || !p.name) nameIn.focus();
 }
 
 /* ---------------------------- boot ---------------------------- */
