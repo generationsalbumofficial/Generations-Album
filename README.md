@@ -12,6 +12,8 @@ The website is a small **installable web app (PWA)**: `index.html` plus a manife
 - **Generations:** each generation has a Father and a Mother. Under them you add Sons and Daughters, each with a name, a photo and a married or unmarried status.
 - **Linked generations:** a married son or daughter (and the father or mother) gets a **+** button until their own family generation is added. After that it becomes an **arrow** button that opens it.
 - **Photos in Google Drive:** photos are compressed in the browser and saved in your Drive folder. Nothing is stored on a third-party image host.
+- **Person UID:** every Father, Mother, Son and Daughter gets a 4-digit ID shown as **UID-7548** (see the person's details). It is unique in the whole sheet. A person who sits in two generations (Son in his parents' one, Father in his own) has the same UID in both.
+- **Direct Connect:** when adding a Son or Daughter, or filling an empty Father / Mother card, tap **Direct Connect** and type the **Generation ID + UID** of a person who is already in another generation. His / her name and photo are taken from there and the two generations are linked (the arrow button opens the other one). Rules: a Son / Daughter can be connected as Father / Mother of a new family, and a Father / Mother as Son / Daughter of a new family; the gender must match; a person who is already connected on that side cannot be connected again. A private generation of another account can be used only if it is shared with you.
 - **Hide a photo:** any person's photo can be hidden. A hidden photo is never sent to viewers or to the public, only to the owner and to admin-mode people.
 - **Public or Private:** each generation can be made public (anyone who has its link can open it) or private.
 - **Sharing with two modes:**
@@ -41,10 +43,10 @@ Google Apps Script web app  ──►  Google Sheet  (Users, Sessions, Generatio
 |---|---|
 | `Users` | UserID, Name, Email, PasswordSalt, PasswordHash, Created, LastLogin |
 | `Sessions` | TokenHash, UserID, Expires |
-| `Generations` | Email, GID, Names, Images, Convertor, Marriage, LinkedGID, Updated, Visibility, Hide |
+| `Generations` | Email, GID, Names, Images, Convertor, Marriage, LinkedGID, Updated, Visibility, Hide, UIDs |
 | `GenShares` | GID, Viewers |
 
-One row is one generation. The list columns are comma separated and in the same order (Father, Mother, Son, Daughter…). `Email` is the admin (owner) of the generation.
+One row is one generation. The list columns (including `UIDs`) are comma separated and in the same order (Father, Mother, Son, Daughter…). `Email` is the admin (owner) of the generation.
 
 `Viewers` stores a list of pairs, for example:
 
@@ -63,7 +65,7 @@ Passwords are stored only as a salted hash. Session tokens are stored only as a 
 | `index.html` | The complete website (HTML, CSS and JavaScript in one file) |
 | `manifest.webmanifest` | App name, colours and icons, so Chrome can install the site as an app |
 | `sw.js` | Service worker. Keeps the app shell so the app opens fast. It never caches your data or photos |
-| `icon-192.png`, `icon-512.png`, `icon-maskable-512.png`, `apple-touch-icon.png`, `favicon-32.png` | App icons (all in the root, no icons folder) |
+| `icons/` | App icons: 192 px, 512 px, maskable 512 px, Apple touch icon and favicon |
 | `favicon.ico`, `favicon.svg` | Browser tab icons |
 | `.nojekyll` | Tells GitHub Pages to publish every file as it is |
 | `backend/Generation_gs.txt` | The Google Apps Script backend. Paste it into the Apps Script editor. It does not need to be hosted |
@@ -109,13 +111,25 @@ If the install option does not show, open the site once, wait a few seconds and 
    ```
 
    Put your web app URL (the `/exec` one) between the quotes.
-2. Upload **all files of the zip** (everything except the `backend` folder, which is only for Apps Script) to the root of your repository. `index.html` must stay in the root, next to `manifest.webmanifest`, `sw.js` and the icon files.
+2. Upload **all files of the zip** (everything except the `backend` folder, which is only for Apps Script) to the root of your repository. `index.html` must stay in the root, next to `manifest.webmanifest`, `sw.js` and the `icons` folder.
 3. Go to **Settings → Pages**, choose the branch (`main`) and the folder `/ (root)`, and save.
 4. After a minute the site opens at `https://USERNAME.github.io/REPO/`.
 
 ### 3. First test
 
 Sign up with a test account, create a generation, add a person with a photo, then share it with a second account in both modes.
+
+## Updating from the version without person UIDs (v7)
+
+Do this in order:
+
+1. Paste the new `backend/Generation_gs.txt` into Apps Script and save.
+2. Run `setup` once (adds the new `UIDs` column).
+3. Run `addUids` once. It gives every existing person a UID (a person in two generations gets the same UID in both). It does not change any "Updated" stamp.
+4. Deploy a **New version**.
+5. Upload the new website files (`index.html` and `sw.js`).
+
+An open copy of the old website gets the message "The website was updated. Please close and open the app" when it tries to save - this is expected.
 
 ## Updating from the old version (the one with UID login)
 
@@ -132,6 +146,9 @@ Do this in order:
 - Anyone who has the **link of a Drive photo** can open it. Hidden photos are not shown by the site, but if you need strong secrecy for photos, keep the Drive folder private and do not make the photos public.
 - Public generations can be opened only by someone who has its Generation ID or the link. There is no search.
 - Free Google accounts have daily quotas for Apps Script (emails, runtime and URL fetches). A family-sized album stays far below them.
+- A UID has 4 digits, so a sheet can hold at most **9000 different people**.
+- Deleting a person who has his / her own family generation (also a person that was added with Direct Connect) deletes that family generation too, as before. The delete confirmation says so.
+- The new Direct Connect texts are English only for now (other languages show them in English).
 - This project is not tested against a large number of users.
 
 ## Tech
