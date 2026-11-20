@@ -1,0 +1,1093 @@
+/**
+ * GENERATION ALBUM - Google Apps Script backend (v8 - person UIDs + Direct Connect, share modes: View / Admin)
+ * ---------------------------------------------------------------------
+ * SETUP (new sheet)
+ *  1. Open your Google Sheet  >  Extensions  >  Apps Script.   2. Delete all old code, paste this file, Save.
+ *  3. Run "setup" once (creates the tabs). Run "authorizeDrive" once and "authorizeMail" once (click Allow).
+ *  4. Deploy > New deployment > Web app > Execute as: Me | Who has access: Anyone.  Copy the URL into CONFIG.API_URL of the website.
+ *  5. After ANY code change: Deploy > Manage deployments > Edit > Version: New version > Deploy.
+ *
+ * UPDATING FROM v7 (no person UIDs)
+ *  a. Paste this file and Save.   b. Select "setup" and Run once (adds the new "UIDs" column).
+ *  c. Select "addUids" and Run ONCE (gives every existing person a 4-digit UID; a person who sits in two generations gets the same UID in both).
+ *  d. Deploy > Manage deployments > Edit > New version > Deploy.
+ *
+ * UPDATING FROM THE OLD VERSION (it had a UID column)
+ *  a. Paste this file and Save.   b. Select "removeUidColumns" and Run ONCE (it keeps every hidden photo, deletes the UID columns).
+ *  c. Select "convertGenSharesToModes" and Run ONCE (old share lists become view-only entries in the new format).
+ *  d. Deploy > Manage deployments > Edit > New version > Deploy.
+ *
+ * TABS
+ *  Users        UserID | Name | Email | PasswordSalt | PasswordHash | Created | LastLogin
+ *  Sessions     TokenHash | UserID | Expires
+ *  Generations  Email | GID | Names | Images | Convertor | Marriage | LinkedGID | Updated | Visibility | Hide | UIDs
+ *               ONE ROW PER GENERATION, lists are comma separated in the same order:
+ *               Names Father,Mother,Son,Daughter...   Images url,url...   Convertor Fa,Mo,So,Da   Marriage Yes,Yes,No,Yes
+ *               LinkedGID  Fa/Mo = GID of their parents' generation (No = not added) / So/Da = GID of their own family generation
+ *               Hide       Yes,No,No...  (Yes = the photo of this person is hidden: never sent to viewers / public, owner + admin-mode see it)
+ *               UIDs       4-digit person IDs, same order (shown on the website as UID-7548). Unique in the whole sheet. The SAME person can sit in two
+ *                          generations (Son in his parents' one, Father in his own): he has the same UID in both. Direct Connect uses GenID + UID.
+ *               Email      = the ADMIN (owner) of the generation. A generation that an admin-mode (E Mod) person adds belongs to THAT person.
+ *  GenShares    GID | Viewers      ONE ROW PER GENERATION. Viewers = list of [email, mode] pairs:
+ *                                  "rizzuid1@gmail.com,V Mod","rizzuid2@gmail.com,E Mod"
+ *                                  V Mod = view only.   E Mod = admin mode: edit / update THAT generation, add the family of a married
+ *                                  person (the new generation is theirs), but NOT transfer / share / Private-Public / delete it.
+ *                                  Only the owner of the generation can add, remove or switch people in this list.
+ *
+ * PHOTOS  Saved as files in the Google Drive folder DRIVE_FOLDER_ID.
+ */
+
+const SESSION_DAYS = 30;
+const HASH_ROUNDS = 500;
+const MAX_FAILS = 5;            // wrong passwords allowed ...
+const FAIL_WINDOW_SEC = 900;    // ... per 15 minutes per email
+const DRIVE_FOLDER_ID = '1TfC9tgyAn-eSojLwx5YBYf5GKYcZcjF4';   // Google Drive folder for photos (or set Script Property DRIVE_FOLDER_ID)
+
+const SCHEMA = {
+  Users:       ['UserID', 'Name', 'Email', 'PasswordSalt', 'PasswordHash', 'Created', 'LastLogin'],
+  Sessions:    ['TokenHash', 'UserID', 'Expires'],
+  Generations: ['Email', 'GID', 'Names', 'Images', 'Convertor', 'Marriage', 'LinkedGID', 'Updated', 'Visibility', 'Hide', 'UIDs'],
+  GenShares:   ['GID', 'Viewers']
+};
+
+function folderId_() { return PropertiesService.getScriptProperties().getProperty('DRIVE_FOLDER_ID') || DRIVE_FOLDER_ID; }
+
+/* ===================== entry points ===================== */
+function doGet() {
+  return out_({ status: 'success', message: 'Generation Album API is running' });
+}
+
+const READ_ONLY = { loadIndex: 1, getGen: 1, publicGen: 1, genShareList: 1, findPerson: 1 };   // these never write, so they do not wait in the queue
+function doPost(e) {
+  const lock = LockService.getScriptLock();
+  let locked = false;
+  try {
+    const req = JSON.parse(e.postData.contents);
+    const fn = ACTIONS[req.action];
+    if (!fn) throw new Error('Unknown action');
+    if (!READ_ONLY[req.action]) { lock.waitLock(25000); locked = true; }
+    const res = fn(req) || {};
+    res.status = 'success';
+    return out_(res);
+  } catch (err) {
+    return out_({ status: 'error', message: String(err && err.message ? err.message : err) });
+  } finally {
+    if (locked) { try { lock.releaseLock(); } catch (x) {} }
+  }
+}
+
+function out_(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
+}
+
+/** Run once from the editor: creates the tabs + headers and asks for permissions. */
+function setup() {
+  Object.keys(SCHEMA).forEach(function (n) { sheet_(n); });
+  Logger.log('Setup complete. Tabs ready: ' + Object.keys(SCHEMA).join(', '));
+}
+
+/* ===================== sheet helpers ===================== */
+/* Returns the tab, creating it and/or writing the header row when it is missing or empty. */
+let SS_ = null;
+function sheet_(name) {
+  const headers = SCHEMA[name];
+  const ss = SS_ || (SS_ = SpreadsheetApp.getActiveSpreadsheet());
+  const found = ss.getSheetByName(name);
+  const cache = CacheService.getScriptCache(), ck = 'sheetok5_' + name;
+  if (found && cache.get(ck)) return found;            // headers were checked a few minutes ago
+  const sh = found || ss.insertSheet(name);
+  if (sh.getMaxColumns() < headers.length) sh.insertColumnsAfter(sh.getMaxColumns(), headers.length - sh.getMaxColumns());
+  if (sh.getLastRow() === 0) {
+    sh.getRange(1, 1, sh.getMaxRows(), headers.length).setNumberFormat('@');      // keep everything as plain text
+    sh.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold');
+    sh.setFrozenRows(1);
+  } else {
+    const first = sh.getRange(1, 1, 1, headers.length).getValues()[0];
+    let missingFrom = -1;
+    for (let i = 0; i < headers.length; i++) {
+      const cur = String(first[i]).trim();
+      if (cur === headers[i]) continue;
+      // older sheet: only NEW trailing columns (e.g. Visibility) are missing -> add their headers automatically
+      if (cur === '' && first.slice(i).every(function (c) { return String(c).trim() === ''; })) { missingFrom = i; break; }
+      throw new Error('Tab "' + name + '" has unexpected headers: column ' + (i + 1) + ' is "' + cur + '" but must be "' + headers[i] + '". Fix that header cell in row 1 (or run fixGenerationHeaders from the editor).');
+    }
+    if (missingFrom >= 0) {
+      const cnt = headers.length - missingFrom;
+      sh.getRange(1, missingFrom + 1, 1, cnt).setValues([headers.slice(missingFrom)]).setFontWeight('bold');
+      sh.getRange(2, missingFrom + 1, Math.max(sh.getMaxRows() - 1, 1), cnt).setNumberFormat('@');
+    }
+  }
+  cache.put(ck, '1', 600);
+  return sh;
+}
+
+/* All data rows (header excluded) as arrays of strings. Sheet row number of rows[i] is i + 2. */
+function rows_(sh) {
+  const n = sh.getLastRow() - 1;
+  if (n < 1) return [];
+  return sh.getRange(2, 1, n, SCHEMA[sh.getName()].length).getValues().map(function (r) {
+    return r.map(function (c) { return String(c == null ? '' : c); });
+  });
+}
+
+function append_(sh, values) {
+  const row = sh.getLastRow() + 1;
+  sh.getRange(row, 1, 1, values.length).setNumberFormat('@').setValues([values.map(String)]);
+  return row;
+}
+
+/* ===================== security helpers ===================== */
+function toHex_(bytes) {
+  return bytes.map(function (b) { return ('0' + (b & 0xff).toString(16)).slice(-2); }).join('');
+}
+function sha256_(s) {
+  return toHex_(Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, s, Utilities.Charset.UTF_8));
+}
+function hashPw_(pw, salt) {
+  let h = salt + pw;
+  for (let i = 0; i < HASH_ROUNDS; i++) h = sha256_(h + salt);
+  return h;
+}
+function sameStr_(a, b) {                       // compare without stopping at the first difference
+  a = String(a); b = String(b);
+  if (a.length !== b.length) return false;
+  let d = 0;
+  for (let i = 0; i < a.length; i++) d |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return d === 0;
+}
+function uuid_() { return Utilities.getUuid().replace(/-/g, ''); }
+
+function failKey_(email) { return 'fail_' + sha256_(email).slice(0, 40); }
+function checkThrottle_(email) {
+  const n = Number(CacheService.getScriptCache().get(failKey_(email)) || 0);
+  if (n >= MAX_FAILS) throw new Error('Too many wrong attempts. Please try again after 15 minutes.');
+}
+function addFail_(email) {
+  const c = CacheService.getScriptCache(), k = failKey_(email);
+  c.put(k, String(Number(c.get(k) || 0) + 1), FAIL_WINDOW_SEC);
+}
+function clearFail_(email) { CacheService.getScriptCache().remove(failKey_(email)); }
+
+/* ---- forgot password: a temporary password is e-mailed; the OLD password keeps working until the new one is used ---- */
+const RESET_MINUTES = 60;        // how long the e-mailed password stays valid
+const RESET_MAX_MAILS = 3;       // mails per e-mail address per hour
+function resetKey_(email) { return 'reset_' + sha256_(email).slice(0, 40); }
+function mailKey_(email) { return 'mails_' + sha256_(email).slice(0, 40); }
+function tempPw_() {             // 10 easy-to-read characters (no 0/O, 1/l/I)
+  const A = 'abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789', u = uuid_();
+  let p = '';
+  for (let i = 0; i < 10; i++) p += A.charAt(parseInt(u.substr(i * 3, 3), 16) % A.length);
+  return p;
+}
+function readReset_(email) {
+  const v = CacheService.getScriptCache().get(resetKey_(email));
+  try { return v ? JSON.parse(v) : null; } catch (e) { return null; }
+}
+
+/* ===================== sessions ===================== */
+function newSession_(userId) {
+  const sh = sheet_('Sessions');
+  const now = Date.now();
+  const all = rows_(sh);
+  for (let i = all.length - 1; i >= 0; i--) {                       // clean expired sessions (bottom-up)
+    if (Number(all[i][2]) < now) sh.deleteRow(i + 2);
+  }
+  const token = uuid_() + uuid_();
+  append_(sh, [sha256_(token), userId, String(now + SESSION_DAYS * 86400000)]);
+  return token;                                                      // only the hash is stored in the sheet
+}
+
+function auth_(token) {
+  if (!token) throw new Error('Please log in first.');
+  const th = sha256_(String(token));
+  const cache = CacheService.getScriptCache();
+  const hit = cache.get('sess_' + th);                 // already checked a moment ago -> no sheet reading at all
+  if (hit) {
+    try { const c = JSON.parse(hit); if (c.u && c.exp > Date.now()) return c.u; } catch (x) {}
+  }
+  const s = rows_(sheet_('Sessions')).filter(function (r) { return r[0] === th; })[0];
+  if (!s || Number(s[2]) < Date.now()) throw new Error('Session expired. Please log in again.');
+  if (String(s[1]).indexOf('~') >= 0) throw new Error('Session expired. Please log in again.');   // old UID-login sessions are no longer valid
+  const u = rows_(sheet_('Users')).filter(function (r) { return r[0] === String(s[1]); })[0];
+  if (!u) throw new Error('Account not found.');
+  const user = { id: u[0], name: u[1], email: u[2].toLowerCase() };
+  const ttl = 300;
+  cache.put('sess_' + th, JSON.stringify({ u: user, exp: Number(s[2]) }), ttl);
+  return user;
+}
+
+/* ---- who may do what with a generation ----
+   owner  (Email column)            : everything
+   E Mod  (GenShares, admin mode)   : open + edit that ONE generation, add the family of a married person (that new generation is HIS)
+   V Mod  (GenShares, view mode)    : look only (see publicGen) */
+const MAIL_DOMAIN = '@gmail.com';
+function fullMail_(s) {
+  s = String(s || '').trim().toLowerCase();
+  return !s ? '' : (s.indexOf('@') < 0 ? s + MAIL_DOMAIN : s);
+}
+const MODE_V = 'V Mod', MODE_E = 'E Mod';
+/* Viewers cell  "a@gmail.com,V Mod","b@gmail.com,E Mod"  ->  [{email, mode:'V'|'E'}].  An old cell (plain emails) = view only. */
+function parseShares_(cell) {
+  const s = String(cell == null ? '' : cell), out = [], seen = {};
+  const add = function (email, mode) {
+    email = fullMail_(email);
+    if (!email || seen[email]) return;
+    seen[email] = true; out.push({ email: email, mode: mode === 'E' ? 'E' : 'V' });
+  };
+  if (s.indexOf('"') >= 0) {
+    const re = /"\s*([^",]+?)\s*,\s*([VvEe])\s*Mod\s*"/g;
+    let m;
+    while ((m = re.exec(s))) add(m[1], m[2].toUpperCase());
+  } else {
+    s.split(',').forEach(function (x) { add(x, 'V'); });
+  }
+  return out;
+}
+function sharesCell_(list) {
+  return list.map(function (x) { return '"' + x.email + ',' + (x.mode === 'E' ? MODE_E : MODE_V) + '"'; }).join(',');
+}
+/* the sheet row (and the people) of one generation's share list, or null */
+function shareRow_(gid) {
+  const all = rows_(sheet_('GenShares'));
+  for (let i = 0; i < all.length; i++) { if (all[i][0].trim() === gid) return { row: i + 2, list: parseShares_(all[i][1]) }; }
+  return null;
+}
+/* 'E', 'V' or '' : how is this generation shared with this email? */
+function shareModeOf_(gid, email) {
+  const f = shareRow_(gid);
+  if (!f) return '';
+  for (let i = 0; i < f.list.length; i++) { if (f.list[i].email === email) return f.list[i].mode; }
+  return '';
+}
+/* gids where this email is in admin mode (E Mod) */
+function editorGids_(email) {
+  const set = {};
+  rows_(sheet_('GenShares')).forEach(function (x) {
+    parseShares_(x[1]).forEach(function (p) { if (p.email === email && p.mode === 'E') set[x[0].trim()] = true; });
+  });
+  return set;
+}
+/* remove the share lists of generations that were deleted or transferred */
+function dropGenShares_(gids) {
+  if (!gids.length) return;
+  const sh = sheet_('GenShares'), all = rows_(sh);
+  for (let i = all.length - 1; i >= 0; i--) { if (gids.indexOf(all[i][0].trim()) >= 0) sh.deleteRow(i + 2); }
+}
+/* the signed-in user must type their account password again for risky actions (uses the same lock-out as login) */
+function checkPassword_(u, pw) {
+  checkThrottle_(u.email);
+  const row = rows_(sheet_('Users')).filter(function (x) { return x[0] === u.id; })[0];
+  if (!row || !pw || !sameStr_(hashPw_(String(pw), row[3].trim()), row[4].trim())) {
+    addFail_(u.email);
+    throw new Error('Wrong password.');
+  }
+  clearFail_(u.email);
+}
+/* the GID, only if this user is the owner (admin) of that generation */
+function ownedGid_(u, gid) {
+  gid = String(gid || '').trim();
+  if (!/^\d{8}$/.test(gid)) throw new Error('Invalid GID.');
+  const ok = rows_(sheet_('Generations')).some(function (g) { return g[1].trim() === gid && g[0].trim().toLowerCase() === u.email; });
+  if (!ok) throw new Error('Generation not found.');
+  return gid;
+}
+function userNames_() {
+  const m = {};
+  rows_(sheet_('Users')).forEach(function (x) { m[x[2].trim().toLowerCase()] = x[1]; });
+  return m;
+}
+
+/* Visibility cell -> 'Public' or 'Private' (empty / anything else = Private, so old rows stay private) */
+function visOf_(v) { return String(v == null ? '' : v).trim() === 'Public' ? 'Public' : 'Private'; }
+
+/* ===================== small helpers ===================== */
+function trim_(x) { return String(x).trim(); }
+/* Hide cell "Yes,No,No" -> array of exactly n entries 'Yes' / 'No' */
+function hideList_(cell, n) {
+  const a = String(cell == null ? '' : cell).split(',').map(trim_);
+  return Array.from({ length: n }, function (_, i) { return a[i] === 'Yes' ? 'Yes' : 'No'; });
+}
+/* Images cell with the photos of hidden people blanked (used for every public / view-mode answer) */
+function maskImages_(images, hideArr) {
+  return String(images == null ? '' : images).split(',').map(function (x, i) { return hideArr[i] === 'Yes' ? '' : x; }).join(',');
+}
+function publicUser_(u) { return { id: u.id, name: u.name, email: u.email }; }
+/* Which rows may THIS user write? His own rows + the rows shared with him in admin mode (E Mod). */
+function editRule_(u, all) {
+  const eg = editorGids_(u.email);
+  return function (g) { return g[0].trim().toLowerCase() === u.email || !!eg[g[1].trim()]; };
+}
+
+/* ===================== generation row validation ===================== */
+function cleanRow_(r) {
+  const s = function (k) { return String(r[k] == null ? '' : r[k]).slice(0, 45000); };
+  const row = { gid: s('gid').trim(), names: s('names'), images: s('images'), conv: s('conv').trim(), marriage: s('marriage').trim(), links: s('links').trim(),
+                vis: s('vis').trim() || 'Private', base: r.base == null ? null : String(r.base).slice(0, 64).trim() };
+  row.uids = r.uids == null ? null : s('uids').trim();
+  if (!/^\d{8}$/.test(row.gid)) throw new Error('Invalid GID.');   // generations without a GID are never stored
+  if (!/^(Public|Private)$/.test(row.vis)) throw new Error('Invalid visibility.');
+  if (!/^(Fa|Mo|So|Da)(,(Fa|Mo|So|Da))*$/.test(row.conv)) throw new Error('Invalid convertor list.');
+  if (!/^(No|Pending|\d{8})(,(No|Pending|\d{8}))*$/.test(row.links)) throw new Error('Invalid linked GID list.');
+  const n = row.conv.split(',').length;
+  if (row.marriage.split(',').length !== n || row.links.split(',').length !== n ||
+      row.names.split(',').length !== n || row.images.split(',').length !== n) throw new Error('List lengths do not match.');
+  row.images.split(',').forEach(function (u) { if (u && !/^https?:\/\/\S+$/.test(u)) throw new Error('Invalid image link.'); });
+  if (row.uids === null) throw new Error('The website was updated. Please close and open the app (or reload the page) and try again.');
+  const ul = row.uids.split(',').map(trim_);
+  if (ul.length !== n) throw new Error('List lengths do not match.');
+  ul.forEach(function (x, i) {
+    if (!/^\d{4}$/.test(x)) throw new Error('Invalid UID.');
+    if (ul.indexOf(x) !== i) throw new Error('A UID can be used only once in a generation.');
+  });
+  row.uids = ul.join(',');
+  row.hide = r.hide == null ? null : s('hide').trim();   // null = an older website version that does not send it: the saved values are kept
+  if (row.hide !== null) {
+    const hl = row.hide === '' ? [] : row.hide.split(',').map(trim_);
+    if (hl.length > n) throw new Error('List lengths do not match.');
+    while (hl.length < n) hl.push('No');
+    hl.forEach(function (x) { if (!/^(Yes|No)$/.test(x)) throw new Error('Invalid hide list.'); });
+    row.hide = hl.join(',');
+  }
+  return row;
+}
+
+/* ===================== person UIDs ===================== */
+const isParentConv_ = function (c) { return c === 'Fa' || c === 'Mo'; };
+/* every 4-digit UID that is already in the sheet, as an object {uid: true} */
+function usedUids_(all) {
+  const used = {};
+  all.forEach(function (g) { g[10].split(',').forEach(function (x) { x = x.trim(); if (/^\d{4}$/.test(x)) used[x] = true; }); });
+  return used;
+}
+/* a free UID (1000-9999); marks it as used */
+function newUid_(used) {
+  for (let i = 0; i < 500; i++) {
+    const u = String(1000 + Math.floor(Math.random() * 9000));
+    if (!used[u]) { used[u] = true; return u; }
+  }
+  for (let n = 1000; n <= 9999; n++) { const u = String(n); if (!used[u]) { used[u] = true; return u; } }
+  throw new Error('All 9000 UIDs are used.');
+}
+/* A UID is one PERSON. It may appear in two generations only as the same person: Father/Mother in his own family generation and Son/Daughter
+   in his parents' one, and those two entries must point to each other (LinkedGID). Anything else is a clash (e.g. a new person got a UID that
+   is already taken). Only the UIDs of the rows being saved are checked. */
+function checkUids_(all, upsert, skip) {
+  const finalRows = {};
+  all.forEach(function (g) { const id = g[1].trim(); if (!skip[id] && /^\d{8}$/.test(id)) finalRows[id] = { conv: g[4], uids: g[10], links: g[6] }; });
+  upsert.forEach(function (row) { finalRows[row.gid] = { conv: row.conv, uids: row.uids, links: row.links }; });
+  const touched = {}, by = {};
+  upsert.forEach(function (row) { row.uids.split(',').forEach(function (u) { touched[u] = true; }); });
+  Object.keys(finalRows).forEach(function (id) {
+    const f = finalRows[id], u = f.uids.split(','), c = f.conv.split(','), l = f.links.split(',');
+    u.forEach(function (x, k) {
+      x = x.trim();
+      if (!x || !touched[x]) return;
+      (by[x] = by[x] || []).push({ gid: id, parent: isParentConv_(c[k].trim()), link: (l[k] || '').trim() });
+    });
+  });
+  Object.keys(by).forEach(function (x) {
+    const e = by[x];
+    if (e.length === 1) return;
+    let ok = false;
+    if (e.length === 2 && e[0].parent !== e[1].parent) {
+      const p = e[0].parent ? e[0] : e[1], c = e[0].parent ? e[1] : e[0];
+      ok = c.link === p.gid || p.link === c.gid;
+    }
+    if (!ok) throw new Error('UID_CLASH:' + x);
+  });
+}
+
+/* After a save, keep this account's OTHER rows (the ones not loaded in the browser) correct. Everything is found through the
+   LinkedGID links - no person IDs are needed:
+   - a Son/Daughter entry links to his/her own family row; the Father/Mother entry of THAT row is the same person
+     -> name + photo + hide setting are copied both ways, and the Father/Mother entry gets this row's GID as its parents' link
+   - a Father/Mother entry links to the parents' row; the Son/Daughter entry there that links back is the same person
+   - a deleted generation's GID is removed from every LinkedGID list (becomes "No")
+   canEdit(g) = may this user write that row (owner: own rows; admin mode E Mod: the generation shared with him).
+   `all` = rows_() snapshot (sheet row of all[i] is i + 2). Rows whose GID is in `skip` are rewritten by the caller. */
+function syncOthers_(sh, all, canEdit, upsert, removedGids, skip) {
+  const mine = function (g) { return canEdit(g) && !skip[g[1].trim()]; };
+  const byGid = {};
+  all.forEach(function (g, i) { if (mine(g)) byGid[g[1].trim()] = i; });
+  const lists = {};
+  const get = function (i) {
+    return lists[i] || (lists[i] = {
+      names: all[i][2].split(','), images: all[i][3].split(','), conv: all[i][4].split(',').map(trim_),
+      marriage: all[i][5].split(','), links: all[i][6].split(',').map(trim_),
+      hide: hideList_(all[i][9], all[i][4].split(',').length), dirty: false, hdirty: false
+    });
+  };
+  upsert.forEach(function (row) {
+    const names = row.names.split(','), images = row.images.split(','), conv = row.conv.split(',').map(trim_), links = row.links.split(',').map(trim_);
+    const hs = row.hide.split(',').map(trim_);
+    conv.forEach(function (c, j) {
+      if (byGid[links[j]] === undefined) return;
+      const L = get(byGid[links[j]]);
+      let k = -1;
+      if (c === 'Fa' || c === 'Mo') {                                   // L = his / her parents' family
+        for (let x = 0; x < L.conv.length; x++) {
+          if (L.conv[x] === (c === 'Fa' ? 'So' : 'Da') && L.links[x] === row.gid) { k = x; break; }
+        }
+        if (k >= 0 && L.marriage[k] !== 'Yes') { L.marriage[k] = 'Yes'; L.dirty = true; }
+      } else {                                                          // L = his / her own family
+        k = L.conv.indexOf(c === 'So' ? 'Fa' : 'Mo');
+        if (k >= 0 && L.links[k] !== row.gid) { L.links[k] = row.gid; L.dirty = true; }
+      }
+      if (k < 0) return;
+      if (L.names[k] !== names[j]) { L.names[k] = names[j]; L.dirty = true; }
+      // the person who saved may not have been able to SEE a hidden photo (it is blank for him): then his blank must never wipe or un-hide the real one
+      const blind = !images[j] && L.images[k] && L.hide[k] === 'Yes' && hs[j] !== 'Yes';
+      if (blind) return;
+      if (L.images[k] !== images[j]) { L.images[k] = images[j]; L.dirty = true; }
+      if (L.hide[k] !== hs[j]) { L.hide[k] = hs[j]; L.hdirty = true; }       // hiding the photo counts in BOTH rows of the same person
+    });
+  });
+  if (removedGids.length) {                                             // a deleted generation must not stay linked from ANY row (even one that belongs to somebody else)
+    all.forEach(function (g, i) {
+      if (skip[g[1].trim()]) return;
+      if (!g[6].split(',').some(function (x) { return removedGids.indexOf(x.trim()) >= 0; })) return;
+      const L = get(i);
+      L.links.forEach(function (x, k) { if (removedGids.indexOf(x) >= 0) { L.links[k] = 'No'; L.dirty = true; } });
+    });
+  }
+  Object.keys(lists).forEach(function (i) {
+    const L = lists[i];
+    if (L.dirty) {
+      sh.getRange(Number(i) + 2, 3, 1, 5).setNumberFormat('@')
+        .setValues([[L.names.join(','), L.images.join(','), L.conv.join(','), L.marriage.join(','), L.links.join(',')]]);
+    }
+    if (L.hdirty) sh.getRange(Number(i) + 2, 10).setNumberFormat('@').setValue(L.hide.join(','));
+  });
+}
+
+/* ===================== old photos: no leftovers in Google Drive ===================== */
+/* Drive file id of a photo link made by uploadPhoto (anything else, e.g. a link typed by hand, is ignored) */
+function photoIds_(cell) {
+  const set = {};
+  String(cell == null ? '' : cell).split(',').forEach(function (x) {
+    const m = /^https:\/\/drive\.google\.com\/thumbnail\?id=([A-Za-z0-9_-]+)/.exec(x.trim());
+    if (m) set[m[1]] = true;
+  });
+  return set;
+}
+/* After a save: a photo that was in a saved / deleted row before, but is used by NO row any more, goes to the Drive bin
+   (the bin keeps it for 30 days). Only files inside the photo folder are touched. Never makes a save fail. */
+function trashUnusedPhotos_(oldCells, newCells) {
+  try {
+    const gone = {};
+    oldCells.forEach(function (c) { Object.keys(photoIds_(c)).forEach(function (id) { gone[id] = true; }); });
+    newCells.forEach(function (c) { Object.keys(photoIds_(c)).forEach(function (id) { delete gone[id]; }); });
+    let ids = Object.keys(gone);
+    if (!ids.length) return;                                       // normal save: no photo was replaced -> no extra work
+    rows_(sheet_('Generations')).forEach(function (g) {            // still used by another row (e.g. the same person in two generations)?
+      Object.keys(photoIds_(g[3])).forEach(function (id) { delete gone[id]; });
+    });
+    ids = Object.keys(gone).slice(0, 25);
+    const folder = folderId_();
+    ids.forEach(function (id) {
+      try {
+        const f = DriveApp.getFileById(id), ps = f.getParents();
+        let inside = false;
+        while (ps.hasNext()) { if (ps.next().getId() === folder) inside = true; }
+        if (inside) f.setTrashed(true);
+      } catch (e) {}
+    });
+  } catch (e) {}
+}
+
+/* ===================== API actions ===================== */
+const ACTIONS = {
+  /* ---- Sign up ---- */
+  register: function (r) {
+    const name = String(r.name || '').trim().replace(/\s+/g, ' ').slice(0, 60);
+    const email = String(r.email || '').trim().toLowerCase();
+    const pw = String(r.password || '');
+    if (!name) throw new Error('Please enter your name.');
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new Error('Please enter a valid email.');
+    if (pw.length < 6) throw new Error('Password must be at least 6 characters.');
+    if (pw.length > 100) throw new Error('Password is too long.');
+    const sh = sheet_('Users');
+    if (rows_(sh).some(function (u) { return u[2].trim().toLowerCase() === email; })) {
+      throw new Error('This email is already registered. Please log in.');
+    }
+    const id = 'u_' + uuid_().slice(0, 12);
+    const salt = uuid_();
+    const now = new Date().toISOString();
+    append_(sh, [id, name, email, salt, hashPw_(pw, salt), now, now]);
+    return { token: newSession_(id), user: { id: id, name: name, email: email } };
+  },
+
+  /* ---- Log in ---- */
+  login: function (r) {
+    const email = String(r.email || '').trim().toLowerCase();
+    const pw = String(r.password || '');
+    if (!email || !pw) throw new Error('Please enter email and password.');
+    checkThrottle_(email);
+    const sh = sheet_('Users');
+    const all = rows_(sh);
+    let idx = -1;
+    for (let i = 0; i < all.length; i++) { if (all[i][2].trim().toLowerCase() === email) { idx = i; break; } }
+    const u = idx >= 0 ? all[idx] : null;
+    let ok = !!u && sameStr_(hashPw_(pw, u[3].trim()), u[4].trim());
+    if (!ok && u) {                                   // maybe the temporary password that was e-mailed
+      const t = readReset_(email);
+      if (t && sameStr_(hashPw_(pw, t.salt), t.hash)) {
+        ok = true;
+        const salt = uuid_();                         // it becomes the real password now
+        sh.getRange(idx + 2, 4, 1, 2).setNumberFormat('@').setValues([[salt, hashPw_(pw, salt)]]);
+        CacheService.getScriptCache().remove(resetKey_(email));
+      }
+    }
+    if (!ok) {
+      addFail_(email);
+      throw new Error('Wrong email or password.');
+    }
+    clearFail_(email);
+    sh.getRange(idx + 2, 7).setNumberFormat('@').setValue(new Date().toISOString());
+    return { token: newSession_(u[0]), user: { id: u[0], name: u[1], email: u[2].toLowerCase() } };
+  },
+
+  /* ---- Forgot password: e-mail a NEW temporary password to the account's own address ----
+     (the real password is never stored - only a hash - so the old one cannot be sent) */
+  forgotPassword: function (r) {
+    const email = String(r.email || '').trim().toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new Error('Please enter a valid email.');
+    const cache = CacheService.getScriptCache(), mk = mailKey_(email);
+    const n = Number(cache.get(mk) || 0);
+    if (n >= RESET_MAX_MAILS) throw new Error('Too many requests. Please try again after 1 hour.');
+    cache.put(mk, String(n + 1), 3600);
+    const u = rows_(sheet_('Users')).filter(function (x) { return x[2].trim().toLowerCase() === email; })[0];
+    if (u) {                                          // same answer whether the account exists or not
+      const pw = tempPw_(), salt = uuid_();
+      cache.put(resetKey_(email), JSON.stringify({ salt: salt, hash: hashPw_(pw, salt) }), RESET_MINUTES * 60);
+      try {
+        MailApp.sendEmail({
+          to: email, name: 'Generation Album', subject: 'Generation Album - your new password',
+          body: 'Hello ' + u[1] + ',\n\nYour new password is:\n\n    ' + pw + '\n\nLog in with it within ' + RESET_MINUTES +
+                ' minutes, then change it from Menu > My account.\nYour old password also keeps working until you use this one.\n\n' +
+                'If you did not ask for this, you can ignore this email.'
+        });
+      } catch (e) { throw new Error('The email could not be sent. Please try again later.'); }
+    }
+    return {};
+  },
+
+  me: function (r) {
+    const u = auth_(r.token);
+    return { user: publicUser_(u) };
+  },
+
+  /* ---- Update my account: name, and (optionally) password ---- */
+  updateProfile: function (r) {
+    const u = auth_(r.token);
+    const name = String(r.name || '').trim().replace(/\s+/g, ' ').slice(0, 60);
+    if (!name) throw new Error('Please enter your name.');
+    const sh = sheet_('Users');
+    const all = rows_(sh);
+    let idx = -1;
+    for (let i = 0; i < all.length; i++) { if (all[i][0] === u.id) { idx = i; break; } }
+    if (idx < 0) throw new Error('Account not found.');
+    const np = String(r.newPassword || '');
+    if (np) {
+      checkThrottle_(u.email);
+      if (!sameStr_(hashPw_(String(r.oldPassword || ''), all[idx][3].trim()), all[idx][4].trim())) {
+        addFail_(u.email);
+        throw new Error('Current password is wrong.');
+      }
+      clearFail_(u.email);
+      if (np.length < 6) throw new Error('New password must be at least 6 characters.');
+      if (np.length > 100) throw new Error('Password is too long.');
+      const salt = uuid_();
+      sh.getRange(idx + 2, 4, 1, 2).setNumberFormat('@').setValues([[salt, hashPw_(np, salt)]]);
+    }
+    sh.getRange(idx + 2, 2).setNumberFormat('@').setValue(name);
+    CacheService.getScriptCache().remove('sess_' + sha256_(String(r.token)));   // this device shows the new name at once
+    return { user: { id: u.id, name: name, email: u.email } };
+  },
+
+  logout: function (r) {
+    if (!r.token) return {};
+    const sh = sheet_('Sessions');
+    const th = sha256_(String(r.token));
+    CacheService.getScriptCache().remove('sess_' + th);
+    const all = rows_(sh);
+    for (let i = all.length - 1; i >= 0; i--) { if (all[i][0] === th) sh.deleteRow(i + 2); }
+    return {};
+  },
+
+  /* ---- Login: ALL generations this account may open, in ONE call.
+     rows   = own generations + generations shared in ADMIN mode (E Mod) - these can be edited (mine:false, role:'E' for the shared ones)
+     shared = generations shared in VIEW mode (V Mod) - photos of hidden people are blanked ---- */
+  loadIndex: function (r) {
+    const u = auth_(r.token);
+    const modes = {}, list = [], shared = [];
+    rows_(sheet_('GenShares')).forEach(function (x) {
+      parseShares_(x[1]).forEach(function (p) { if (p.email === u.email) modes[x[0].trim()] = p.mode; });
+    });
+    let nm = null;
+    const allRows = rows_(sheet_('Generations')), usedUids = Object.keys(usedUids_(allRows)).join(',');   // the website picks new UIDs that are not in this list
+    allRows.forEach(function (g) {
+      const owner = g[0].trim().toLowerCase(), gid = g[1].trim();
+      if (!/^\d{8}$/.test(gid)) return;                     // old "Pending" rows are ignored
+      const hide = hideList_(g[9], g[4].split(',').length);
+      if (owner === u.email) {
+        list.push({ full: true, row: { gid: gid, names: g[2], images: g[3], conv: g[4], marriage: g[5], links: g[6], vis: visOf_(g[8]), hide: hide.join(','), uids: g[10], mine: true, role: '', by: '', upd: g[7] } });
+      } else if (modes[gid] === 'E') {
+        nm = nm || userNames_();
+        list.push({ full: true, row: { gid: gid, names: g[2], images: g[3], conv: g[4], marriage: g[5], links: g[6], vis: visOf_(g[8]), hide: hide.join(','), uids: g[10], mine: false, role: 'E', by: nm[owner] || owner, upd: g[7] } });
+      } else if (modes[gid] === 'V') {
+        nm = nm || userNames_();
+        shared.push({ gid: gid, names: g[2], images: maskImages_(g[3], hide), conv: g[4], marriage: g[5], links: g[6], vis: visOf_(g[8]), by: nm[owner] || owner });
+      }
+    });
+    return { rows: list, shared: shared, usedUids: usedUids };
+  },
+
+  /* ---- Go button: ONE row, found by its GID. Owner or admin-mode (E Mod) only. ---- */
+  getGen: function (r) {
+    const u = auth_(r.token);
+    const gid = String(r.gid || '').trim();
+    if (!/^\d{8}$/.test(gid)) throw new Error('Invalid GID.');
+    const sh = sheet_('Generations');
+    const n = sh.getLastRow() - 1;
+    if (n >= 1) {
+      const ids = sh.getRange(2, 1, n, 2).getValues();
+      for (let i = 0; i < n; i++) {
+        if (String(ids[i][1]).trim() !== gid) continue;
+        const owner = String(ids[i][0]).trim().toLowerCase(), mine = owner === u.email;
+        if (!mine && shareModeOf_(gid, u.email) !== 'E') break;
+        const g = sh.getRange(i + 2, 1, 1, SCHEMA.Generations.length).getValues()[0].map(function (c) { return String(c == null ? '' : c); });
+        return { row: { gid: g[1], names: g[2], images: g[3], conv: g[4], marriage: g[5], links: g[6], vis: visOf_(g[8]), hide: hideList_(g[9], g[4].split(',').length).join(','), uids: g[10],
+                        mine: mine, role: mine ? '' : 'E', by: mine ? '' : (userNames_()[owner] || owner), upd: g[7] } };
+      }
+    }
+    throw new Error('Generation not found.');
+  },
+
+  /* ---- Read-only lookup of ONE generation by its GID. NO login needed for a Public generation.
+     A signed-in user can also open a Private generation that is his own or was shared with him (V Mod or E Mod).
+     Private + not allowed and a wrong ID give the SAME answer. The owner's email is never sent. Hidden photos are blanked. ---- */
+  publicGen: function (r) {
+    const gid = String(r.gid || '').trim();
+    if (!/^\d{8}$/.test(gid)) throw new Error('Invalid GID.');
+    let me = null;
+    if (r.token) { try { me = auth_(r.token); } catch (e) { me = null; } }
+    const sh = sheet_('Generations');
+    const n = sh.getLastRow() - 1;
+    if (n >= 1) {
+      const ids = sh.getRange(2, 2, n, 1).getValues();                  // only the GID column is scanned
+      for (let i = 0; i < n; i++) {
+        if (String(ids[i][0]).trim() !== gid) continue;
+        const g = sh.getRange(i + 2, 1, 1, SCHEMA.Generations.length).getValues()[0].map(function (c) { return String(c == null ? '' : c); });
+        const owner = g[0].trim().toLowerCase(), vis = visOf_(g[8]);
+        const isOwner = !!me && owner === me.email;
+        const mode = me && !isOwner ? shareModeOf_(gid, me.email) : '';
+        if (vis === 'Public' || isOwner || mode) {
+          return { row: { gid: g[1], names: g[2], images: maskImages_(g[3], hideList_(g[9], g[4].split(',').length)), conv: g[4], marriage: g[5], links: g[6], vis: vis,
+                          by: mode ? (userNames_()[owner] || '') : '' } };
+        }
+        break;
+      }
+    }
+    throw new Error('No generation found with this ID, or it is private.');
+  },
+
+  /* ---- DIRECT CONNECT: look up ONE person by Generation ID + UID, so he / she can be added to another generation without typing again.
+     Needs a login. The generation must be Public, the user's own, or shared with him (View or Admin mode) - otherwise the answer is the same
+     as for a wrong ID. Hidden photos are blanked. `used` = this person already has his / her other side elsewhere
+     (a Son/Daughter whose own family exists, or a Father/Mother whose parents' generation exists), so he / she cannot be connected again. ---- */
+  findPerson: function (r) {
+    const me = auth_(r.token);
+    const gid = String(r.gid || '').trim(), uid = String(r.uid || '').trim();
+    if (!/^\d{8}$/.test(gid)) throw new Error('Generation ID must have 8 digits.');
+    if (!/^\d{4}$/.test(uid)) throw new Error('UID must have 4 digits, for example UID-7548.');
+    const notFound = function () { return new Error('No person found with this Generation ID and UID. A private generation can be used only by its owner or people it is shared with.'); };
+    const all = rows_(sheet_('Generations'));
+    let hit = null;
+    all.forEach(function (g) { if (g[1].trim() === gid) hit = g; });
+    if (!hit) throw notFound();
+    const owner = hit[0].trim().toLowerCase();
+    if (!(visOf_(hit[8]) === 'Public' || owner === me.email || shareModeOf_(gid, me.email))) throw notFound();
+    const conv = hit[4].split(',').map(trim_), j = hit[10].split(',').map(trim_).indexOf(uid);
+    if (j < 0) throw notFound();
+    const c = conv[j], parentSide = isParentConv_(c);
+    let used = false, usedGid = '';
+    all.forEach(function (g) {
+      if (g[1].trim() === gid) return;
+      const u2 = g[10].split(',').map(trim_), c2 = g[4].split(',').map(trim_);
+      u2.forEach(function (x, k) { if (x === uid && isParentConv_(c2[k]) !== parentSide) { used = true; usedGid = g[1].trim(); } });
+    });
+    const hide = hideList_(hit[9], conv.length);
+    return { person: { gid: gid, uid: uid, conv: c, name: String(hit[2].split(',')[j] || '').trim(),
+                       photo: hide[j] === 'Yes' ? '' : String(hit[3].split(',')[j] || '').trim(),
+                       married: String(hit[5].split(',')[j] || '').trim() === 'Yes', link: String(hit[6].split(',')[j] || '').trim(), used: used, usedGid: usedGid } };
+  },
+
+  /* ---- TRANSFER: give a generation to another registered account (their email replaces yours) ----
+     Moves the generation AND every generation below it (sons' / daughters' families) - the website shows a red alert first.
+     The admin must type the account password. Share lists of the moved generations are cleared.
+     Links to generations that stay behind are KEPT, so if those are transferred to the same account later,
+     the families are joined again automatically. */
+  transferGen: function (r) {
+    const u = auth_(r.token);
+    const gid = String(r.gid || '').trim();
+    const to = String(r.to || '').trim().toLowerCase();
+    if (!/^\d{8}$/.test(gid)) throw new Error('Invalid GID.');
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) throw new Error('Please enter a valid email.');
+    if (to === u.email) throw new Error('This generation already belongs to this account.');
+    checkPassword_(u, r.password);                                    // the admin must confirm with the account password
+    if (!rows_(sheet_('Users')).some(function (x) { return x[2].trim().toLowerCase() === to; })) {
+      throw new Error('No account found with this email. Ask them to sign up first.');
+    }
+    const sh = sheet_('Generations');
+    const all = rows_(sh);
+    const byGid = {};
+    all.forEach(function (g, i) { if (g[0].trim().toLowerCase() === u.email && /^\d{8}$/.test(g[1].trim())) byGid[g[1].trim()] = i; });
+    if (byGid[gid] === undefined) throw new Error('Generation not found.');
+    const set = {}, order = [], queue = [gid];                       // this generation + all below it
+    while (queue.length) {
+      const id = queue.shift();
+      if (set[id]) continue;
+      set[id] = true; order.push(id);
+      const g = all[byGid[id]], conv = g[4].split(','), links = g[6].split(',');
+      conv.forEach(function (c, k) {
+        const l = String(links[k] || '').trim(), cc = c.trim();
+        if ((cc === 'So' || cc === 'Da') && byGid[l] !== undefined && !set[l]) queue.push(l);
+      });
+    }
+    const stamp = new Date().toISOString();
+    order.forEach(function (id) {
+      const g = all[byGid[id]];
+      sh.getRange(byGid[id] + 2, 1, 1, 8).setNumberFormat('@')
+        .setValues([[to, g[1], g[2], g[3], g[4], g[5], g[6], stamp]]);
+    });
+    dropGenShares_(order);                                            // the new admin decides who may look at these now
+    return { count: order.length };
+  },
+
+  /* upsert changed rows (key = the generation's GID) and delete removed ones.
+     The owner works on all own rows. An admin-mode person (E Mod) can write the generation shared with him and can ADD generations
+     (the family of a married person): a generation he creates belongs to HIM (he is its admin). He cannot delete a generation of
+     somebody else and cannot change its Private / Public.
+     base = the "Updated" stamp the website loaded the row with ('NEW' = the website created it): if someone else saved that
+     row since, nothing is written and the website is told to reload (CONFLICT) - so two phones never overwrite each other. */
+  saveRows: function (r) {
+    const u = auth_(r.token);
+    const sh = sheet_('Generations');
+    const all = rows_(sh);
+    const canEdit = editRule_(u, all);
+    const where = {}, ownerOf = {}, taken = {};         // gid -> sheet row number ; gid -> owner email ; every gid
+    all.forEach(function (g, i) {
+      const o = g[0].trim().toLowerCase(), id = g[1].trim();
+      taken[id] = true;
+      if (!canEdit(g)) return;
+      where[id] = i + 2; ownerOf[id] = o;
+    });
+    const upsert = (r.upsert || []).map(cleanRow_);
+    const remove = (r.remove || []).map(String);
+    const conflict = function () { return new Error('CONFLICT: This family was changed from another phone. Reload to see the latest version.'); };
+    remove.forEach(function (k) {
+      if (where[k] && ownerOf[k] !== u.email) throw new Error('Only the admin (owner) of a generation can delete it.');
+    });
+    upsert.forEach(function (row) {                     // check everything first, write nothing if anything clashes
+      const at = where[row.gid];
+      if (row.base === null) return;                    // very old website version: no check
+      if (row.base === 'NEW') {
+        if (at) throw conflict();
+        if (taken[row.gid]) throw new Error('Could not create a unique Generation ID. Please try again.');
+        return;
+      }
+      if (!at || all[at - 2][7] !== row.base) throw conflict();
+    });
+    upsert.forEach(function (row) {                     // hide list: a website that does not send it keeps the saved values
+      const at = where[row.gid], n = row.conv.split(',').length;
+      if (row.hide === null) row.hide = at ? hideList_(all[at - 2][9], n).join(',') : new Array(n).fill('No').join(',');
+    });
+    const stamp = new Date().toISOString();
+    const skip = {};                                    // rows the website itself is rewriting / deleting now
+    upsert.forEach(function (row) { skip[row.gid] = true; });
+    remove.forEach(function (k) { skip[k] = true; });
+    const removedGids = remove.filter(function (k) { return where[k] && /^\d{8}$/.test(k); });
+    const oldPhotos = [];                               // photo cells of the rows that are about to be replaced / deleted
+    upsert.forEach(function (row) { if (where[row.gid]) oldPhotos.push(all[where[row.gid] - 2][3]); });
+    remove.forEach(function (k) { if (where[k]) oldPhotos.push(all[where[k] - 2][3]); });
+    checkUids_(all, upsert, skip);                      // a UID is one person: nothing is written when a new person got a UID that is already taken
+    syncOthers_(sh, all, canEdit, upsert, removedGids, skip);      // the same person in the neighbouring generations I may write
+    upsert.forEach(function (row) {
+      let owner, vis = row.vis;
+      if (where[row.gid]) {
+        const g = all[where[row.gid] - 2];
+        owner = g[0].trim().toLowerCase();              // an existing row keeps its owner
+        if (owner !== u.email) vis = visOf_(g[8]);      // only the owner changes Private / Public
+      } else {
+        owner = u.email;                                // a new generation belongs to whoever creates it
+      }
+      ownerOf[row.gid] = owner;
+      const vals = [owner, row.gid, row.names, row.images, row.conv, row.marriage, row.links, stamp, vis, row.hide, row.uids];
+      if (where[row.gid]) {
+        sh.getRange(where[row.gid], 1, 1, vals.length).setNumberFormat('@').setValues([vals]);
+      } else {
+        where[row.gid] = append_(sh, vals);
+      }
+    });
+    remove.map(function (k) { return where[k]; }).filter(Boolean)
+      .sort(function (a, b) { return b - a; })
+      .forEach(function (n) { sh.deleteRow(n); });
+    dropGenShares_(removedGids);
+    trashUnusedPhotos_(oldPhotos, upsert.map(function (row) { return row.images; }));
+    return { upd: stamp };
+  },
+
+  /* ---- SHARING (per generation). Only the OWNER (admin) of a generation can use these.
+     mode 'V' = view only (V Mod)   mode 'E' = admin mode (E Mod): can edit that generation, but not transfer / share / Private-Public / delete. ---- */
+  genShareList: function (r) {
+    const u = auth_(r.token), gid = ownedGid_(u, r.gid);
+    const nm = userNames_(), found = shareRow_(gid);
+    const viewers = (found ? found.list : []).map(function (p) { return { email: p.email, name: nm[p.email] || '', mode: p.mode }; });
+    return { viewers: viewers };
+  },
+  genShareAdd: function (r) {
+    const u = auth_(r.token), gid = ownedGid_(u, r.gid);
+    const email = String(r.email || '').trim().toLowerCase();
+    const mode = r.mode === 'E' ? 'E' : 'V';
+    if (!/^[^\s@,"]+@[^\s@,"]+\.[^\s@,"]+$/.test(email)) throw new Error('Please enter a valid email.');
+    if (email === u.email) throw new Error('This is your own email.');
+    if (!rows_(sheet_('Users')).some(function (x) { return x[2].trim().toLowerCase() === email; })) {
+      throw new Error('No account found with this email. Ask them to sign up first.');
+    }
+    const sh = sheet_('GenShares'), found = shareRow_(gid);
+    if (found && found.list.some(function (p) { return p.email === email; })) throw new Error('Already shared with this email. Use the mode button to change it.');
+    if (found) {
+      sh.getRange(found.row, 2).setNumberFormat('@').setValue(sharesCell_(found.list.concat([{ email: email, mode: mode }])));
+    } else {
+      append_(sh, [gid, sharesCell_([{ email: email, mode: mode }])]);
+    }
+    return {};
+  },
+  /* the owner switches a person between view mode and admin mode */
+  genShareSetMode: function (r) {
+    const u = auth_(r.token), gid = ownedGid_(u, r.gid);
+    const email = String(r.email || '').trim().toLowerCase();
+    const mode = r.mode === 'E' ? 'E' : 'V';
+    const sh = sheet_('GenShares'), found = shareRow_(gid);
+    if (!found || !found.list.some(function (p) { return p.email === email; })) throw new Error('This person is not in the share list.');
+    const list = found.list.map(function (p) { return p.email === email ? { email: p.email, mode: mode } : p; });
+    sh.getRange(found.row, 2).setNumberFormat('@').setValue(sharesCell_(list));
+    return {};
+  },
+  genShareRemove: function (r) {
+    const u = auth_(r.token), gid = ownedGid_(u, r.gid);
+    const email = String(r.email || '').trim().toLowerCase();
+    const sh = sheet_('GenShares'), found = shareRow_(gid);
+    if (!found) return {};
+    const left = found.list.filter(function (p) { return p.email !== email; });
+    if (!left.length) sh.deleteRow(found.row);                         // nobody left -> the row goes away
+    else sh.getRange(found.row, 2).setNumberFormat('@').setValue(sharesCell_(left));
+    return {};
+  },
+
+  /* ---- Photo upload: the photo is saved as a file in the Google Drive folder (DRIVE_FOLDER_ID).
+     The script runs as the owner of that folder, so no key is needed. ---- */
+  uploadPhoto: function (r) {
+    auth_(r.token);
+    const m = /^data:(image\/(?:jpeg|png|webp));base64,(.+)$/.exec(String(r.dataUrl || ''));
+    if (!m) throw new Error('Invalid image.');
+    if (m[2].length > 2000000) throw new Error('Image is too large.');
+    let folder;
+    try { folder = DriveApp.getFolderById(folderId_()); }
+    catch (e) { throw new Error('Photo folder not found. Check DRIVE_FOLDER_ID in the script.'); }
+    const ext = m[1] === 'image/png' ? 'png' : m[1] === 'image/webp' ? 'webp' : 'jpg';
+    let file;
+    try {
+      file = folder.createFile(Utilities.newBlob(Utilities.base64Decode(m[2]), m[1], 'photo_' + Date.now() + '_' + uuid_().slice(0, 6) + '.' + ext));
+    } catch (e) { throw new Error('Photo could not be saved to Google Drive.'); }
+    try { file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW); } catch (e) {}   // the folder is public already; this makes sure
+    return { url: 'https://drive.google.com/thumbnail?id=' + file.getId() + '&sz=w600' };
+  }
+};
+
+/* =====================================================================
+   ADMIN HELPERS - run from the Apps Script editor (never from the website)
+   ===================================================================== */
+
+/** Run ONCE from the editor (and click Allow): gives the script permission to send e-mail for "Forgot password". */
+function authorizeMail() {
+  MailApp.sendEmail(Session.getEffectiveUser().getEmail(), 'Generation Album - mail test', 'E-mail sending works.');
+  Logger.log('Test mail sent to ' + Session.getEffectiveUser().getEmail());
+}
+
+/** Run ONCE from the editor (and click Allow): gives the script permission to use Google Drive and checks the photo folder.
+    It saves a tiny test file in the folder and moves it to the bin again. Then deploy a New version. */
+function authorizeDrive() {
+  const folder = DriveApp.getFolderById(folderId_());
+  const f = folder.createFile('test.txt', 'Drive access works.');
+  f.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+  Logger.log('Folder OK: ' + folder.getName() + ' | test file saved and shared: ' + f.getId());
+  f.setTrashed(true);
+}
+
+/** Repair: writes the correct header row (row 1) of the Generations tab. Only row 1 is changed - no data is touched. */
+function fixGenerationHeaders() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName('Generations');
+  if (!sh) { sheet_('Generations'); Logger.log('No Generations tab - a new one was created.'); return; }
+  const H = SCHEMA.Generations;
+  if (sh.getMaxColumns() < H.length) sh.insertColumnsAfter(sh.getMaxColumns(), H.length - sh.getMaxColumns());
+  Logger.log('Headers before: ' + sh.getRange(1, 1, 1, H.length).getValues()[0].join(' | '));
+  sh.getRange(1, 1, 1, H.length).setValues([H]).setFontWeight('bold');
+  sh.getRange(2, H.length, Math.max(sh.getMaxRows() - 1, 1), 1).setNumberFormat('@');
+  CacheService.getScriptCache().remove('sheetok5_Generations');
+  Logger.log('Headers now: ' + H.join(' | ') + '. Now deploy a New version.');
+}
+
+/** ONE-TIME: removes the UID system from the sheet. Select "removeUidColumns" and Run ONCE, then deploy a New version.
+    - The people whose photo was hidden stay hidden (HiddenUIDs is converted into the new "Hide" column: Yes,No,No ...).
+    - The UID column (and the old HiddenUIDs column) is deleted. Safe to run again (it does nothing when already converted). */
+function removeUidColumns() {
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Generations');
+  if (!sh) { Logger.log('No Generations tab found.'); return; }
+  const head = sh.getRange(1, 1, 1, Math.min(11, sh.getMaxColumns())).getValues()[0].map(function (c) { return String(c).trim(); });
+  if (head[9] === 'Hide') { Logger.log('Already converted. Headers: ' + head.join(' | ')); return; }
+  if (head[9] !== 'UID') { Logger.log('Unexpected headers, nothing changed: ' + head.join(' | ')); return; }
+  const n = sh.getLastRow() - 1;
+  if (n >= 1) {
+    const data = sh.getRange(2, 1, n, 11).getValues();
+    const hide = data.map(function (r) {
+      const count = String(r[4]).split(',').length;
+      const codes = String(r[9] == null ? '' : r[9]).split(',').map(trim_);
+      const hidden = String(r[10] == null ? '' : r[10]).split(',').map(trim_).filter(Boolean);
+      return [Array.from({ length: count }, function (_, i) { return codes[i] && hidden.indexOf(codes[i]) >= 0 ? 'Yes' : 'No'; }).join(',')];
+    });
+    sh.getRange(2, 11, n, 1).setNumberFormat('@').setValues(hide);          // Yes,No,... into the old HiddenUIDs column
+  }
+  sh.getRange(1, 11).setValue('Hide');
+  sh.deleteColumn(10);                                                       // the UID column goes - "Hide" moves to column 10
+  sh.getRange(1, 10).setValue('Hide').setFontWeight('bold');
+  CacheService.getScriptCache().remove('sheetok5_Generations');
+  Logger.log('Done: UID column deleted, Hide column ready. Now deploy a New version.');
+}
+
+/** ONE-TIME: gives every existing person a 4-digit UID (new "UIDs" column). Select "addUids" and Run ONCE, then deploy a New version.
+    A person who sits in two generations (Son in his parents' one, Father in his own) gets the SAME UID in both - found through the LinkedGID links.
+    Existing UIDs are kept. The "Updated" stamps are not changed, so nobody gets a conflict. Safe to run again. */
+function addUids() {
+  const sh = sheet_('Generations'), all = rows_(sh);
+  const used = usedUids_(all), rowOfGid = {};
+  all.forEach(function (g, i) { rowOfGid[g[1].trim()] = i; });
+  const entries = [], at = {}, root = [];
+  const find = function (x) { while (root[x] !== x) { root[x] = root[root[x]]; x = root[x]; } return x; };
+  const join = function (a, b) { a = find(a); b = find(b); if (a !== b) root[b] = a; };
+  all.forEach(function (g, i) {
+    const conv = g[4].split(',').map(trim_), links = g[6].split(',').map(trim_), uids = g[10].split(',').map(trim_);
+    conv.forEach(function (c, j) {
+      const id = entries.length; root.push(id); at[i + ':' + j] = id;
+      entries.push({ i: i, c: c, link: links[j] || '', uid: /^\d{4}$/.test(uids[j] || '') ? uids[j] : '' });
+    });
+  });
+  entries.forEach(function (e, id) {                                   // the same person in two generations
+    const L = rowOfGid[e.link];
+    if (L === undefined || L === e.i) return;
+    const lc = all[L][4].split(',').map(trim_), ll = all[L][6].split(',').map(trim_);
+    if (e.c === 'So' || e.c === 'Da') {
+      const k = lc.indexOf(e.c === 'So' ? 'Fa' : 'Mo');
+      if (k >= 0) join(id, at[L + ':' + k]);
+    } else if (e.c === 'Fa' || e.c === 'Mo') {
+      for (let k = 0; k < lc.length; k++) { if (lc[k] === (e.c === 'Fa' ? 'So' : 'Da') && ll[k] === all[e.i][1].trim()) join(id, at[L + ':' + k]); }
+    }
+  });
+  const uidOf = {};                                                    // component -> UID (an existing one is kept)
+  entries.forEach(function (e, id) { const r = find(id); if (e.uid && !uidOf[r]) uidOf[r] = e.uid; });
+  entries.forEach(function (e, id) { const r = find(id); if (!uidOf[r]) uidOf[r] = newUid_(used); });
+  let rows = 0;
+  all.forEach(function (g, i) {
+    const n = g[4].split(',').length, out = [];
+    for (let j = 0; j < n; j++) out.push(uidOf[find(at[i + ':' + j])]);
+    const cell = out.join(',');
+    if (cell !== g[10]) { sh.getRange(i + 2, 11).setNumberFormat('@').setValue(cell); rows++; }
+  });
+  Logger.log('Done: ' + rows + ' generation row(s) updated, ' + Object.keys(used).length + ' UIDs in use. Now deploy a New version.');
+}
+
+/** One-time cleanup: deletes every old "Pending" row (generation without a GID) from the Generations tab.
+    Select "removePendingRows" and Run. */
+function removePendingRows() {
+  const sh = sheet_('Generations');
+  const all = rows_(sh);
+  let n = 0;
+  for (let i = all.length - 1; i >= 0; i--) {
+    if (!/^\d{8}$/.test(all[i][1].trim())) { sh.deleteRow(i + 2); n++; }
+  }
+  Logger.log('Removed ' + n + ' pending row(s).');
+}
+
+/** ONE-TIME: converts the old GenShares tab (GID | Viewer | Created, one row per viewer)
+    into the new one (GID | Viewers, one row per generation, "@gmail.com" removed).
+    Select "migrateGenShares" and Run ONCE, then deploy the new version. Safe to run again (it does nothing if already converted). */
+function migrateGenShares() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName('GenShares');
+  if (!sh) { sheet_('GenShares'); Logger.log('No old GenShares tab - a fresh one was created.'); return; }
+  const last = sh.getLastRow();
+  const head = last >= 1 ? sh.getRange(1, 1, 1, 3).getValues()[0].map(function (c) { return String(c).trim(); }) : [];
+  if (head[1] === 'Viewers') { Logger.log('GenShares is already in the new format.'); return; }
+  const data = last > 1 ? sh.getRange(2, 1, last - 1, 2).getValues() : [];
+  const order = [], map = {};
+  data.forEach(function (x) {
+    const gid = String(x[0]).trim(), email = String(x[1]).trim().toLowerCase();
+    if (!gid || !email) return;
+    if (!map[gid]) { map[gid] = []; order.push(gid); }
+    if (map[gid].indexOf(email) < 0) map[gid].push(email);
+  });
+  sh.clear();
+  sh.getRange(1, 1, sh.getMaxRows(), 2).setNumberFormat('@');
+  sh.getRange(1, 1, 1, 2).setValues([SCHEMA.GenShares]).setFontWeight('bold');
+  sh.setFrozenRows(1);
+  if (sh.getMaxColumns() > 2) sh.deleteColumns(3, sh.getMaxColumns() - 2);      // the old "Created" column goes away
+  if (order.length) sh.getRange(2, 1, order.length, 2).setValues(order.map(function (g) { return [g, sharesCell_(map[g].map(function (e) { return { email: fullMail_(e), mode: 'V' }; }))]; }));
+  CacheService.getScriptCache().remove('sheetok5_GenShares');
+  Logger.log('Done: ' + data.length + ' old row(s) -> ' + order.length + ' generation row(s).');
+}
+
+/** ONE-TIME: rewrites every share list into the new format  "email,V Mod","email,E Mod"  (old entries become V Mod = view only).
+    Select "convertGenSharesToModes" and Run ONCE. Safe to run again. */
+function convertGenSharesToModes() {
+  const sh = sheet_('GenShares'), all = rows_(sh);
+  let n = 0;
+  all.forEach(function (x, i) {
+    const cell = sharesCell_(parseShares_(x[1]));
+    if (cell !== x[1]) { sh.getRange(i + 2, 2).setNumberFormat('@').setValue(cell); n++; }
+  });
+  Logger.log('Converted ' + n + ' share list(s).');
+}
+
+/** Forgot a password? Fill the 2 lines, select "resetPassword", Run. */
+function resetPassword() {
+  const EMAIL = 'you@example.com';
+  const NEW_PASSWORD = 'newpass123';
+  if (NEW_PASSWORD.length < 6) throw new Error('Password must be at least 6 characters.');
+  const sh = sheet_('Users');
+  const all = rows_(sh);
+  for (let i = 0; i < all.length; i++) {
+    if (all[i][2].trim().toLowerCase() === EMAIL.trim().toLowerCase()) {
+      const salt = uuid_();
+      sh.getRange(i + 2, 4, 1, 2).setNumberFormat('@').setValues([[salt, hashPw_(NEW_PASSWORD, salt)]]);
+      clearFail_(EMAIL.trim().toLowerCase());
+      Logger.log('Password reset done for ' + EMAIL);
+      return;
+    }
+  }
+  Logger.log('Email NOT found in Users tab.');
+}
+
+/** Quick health check of one account: is the salt / hash really saved? */
+function checkUser() {
+  const EMAIL = 'you@example.com';
+  const all = rows_(sheet_('Users'));
+  for (let i = 0; i < all.length; i++) {
+    if (all[i][2].trim().toLowerCase() === EMAIL.trim().toLowerCase()) {
+      Logger.log('FOUND row ' + (i + 2) + ' | name=' + all[i][1] + ' | salt length=' + all[i][3].length + ' (should be 32) | hash length=' + all[i][4].length + ' (should be 64)');
+      return;
+    }
+  }
+  Logger.log('Email NOT found in Users tab.');
+}
